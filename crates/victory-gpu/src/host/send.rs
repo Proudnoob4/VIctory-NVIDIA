@@ -230,6 +230,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         }
     }
     let one = |i: usize| {
+        let _span = crate::timeline::span("under: scatter pairs packed");
         let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {

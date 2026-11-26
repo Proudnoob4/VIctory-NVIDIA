@@ -1189,6 +1189,7 @@ impl Host {
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
+            let _span = crate::timeline::span("under: steps' descriptor slots");
             for op in &ops {
                 if let To::Slot(heap, index) = &op.to
                     && *index as usize / 4 % parts == part

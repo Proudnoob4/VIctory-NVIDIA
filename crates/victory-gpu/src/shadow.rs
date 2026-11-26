@@ -4709,6 +4709,7 @@ impl Shadow {
             let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
             let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
+                let _span = crate::timeline::span("under: a page merged under a flight's writes");
                 let (lo, hi) = page_of(i);
                 if lo < hi && !over.load(Ordering::Relaxed) {
                     // SAFETY: the reference holds the copy's bytes at the
