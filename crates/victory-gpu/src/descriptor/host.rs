@@ -1891,6 +1891,14 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     room.min(most.max(DYNAMIC))
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self);
+        }
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;

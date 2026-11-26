@@ -2392,6 +2392,12 @@ struct Deferred {
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
+    /// Another list's budget this recording charges instead of its own
+    /// (`crate::indirect::hoisting`: the pieces of one title list share
+    /// one), and whether it is the card's copy; then whether a clamp of
+    /// this recording used it.
+    lent_budget: Option<(ID3D12Resource, bool)>,
+    lent_used: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -7233,6 +7239,26 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        {
+            let mut deferred = self.deferred();
+            if let Some((lent, card)) = deferred.lent_budget.clone() {
+                if card && !deferred.lent_used {
+                    // The owner's list left the card's copy common when it
+                    // closed; this one gives it back so when it closes.
+                    // SAFETY: an open list and a live buffer.
+                    unsafe {
+                        self.list.ResourceBarrier(&[transition(
+                            &lent,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )])
+                    };
+                }
+                deferred.lent_used = true;
+                // SAFETY: a live buffer.
+                return Some(unsafe { lent.GetGPUVirtualAddress() });
+            }
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -7271,6 +7297,29 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+    }
+
+    /// The budget this recording charges, made ready here if it is not yet,
+    /// for other lists of the same title list to charge too
+    /// ([`HostList::lend_budget`]): the buffer and whether it is the card's copy.
+    pub(crate) fn budget_to_lend(&self) -> Option<(ID3D12Resource, bool)> {
+        self.budget()?;
+        if let Some(lent) = self.deferred().lent_budget.clone() {
+            return Some(lent);
+        }
+        match self.card_budget.get().and_then(Option::as_ref) {
+            Some(card) => Some((card.clone(), true)),
+            None => self.budget.get().and_then(Option::as_ref).map(|(b, _)| (b.clone(), false)),
+        }
+    }
+
+    /// From here until its reset the list's clamps charge `budget`
+    /// ([`HostList::budget_to_lend`] of a list that runs before it, in the
+    /// same submission) instead of a budget of its own.
+    pub(crate) fn lend_budget(&self, budget: (ID3D12Resource, bool)) {
+        let mut deferred = self.deferred();
+        deferred.lent_budget = Some(budget);
+        deferred.lent_used = false;
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -7319,6 +7368,22 @@ impl HostList {
     /// of the budget: its notes on mesh records go to the mapped words
     /// (read at the next submission), and it goes back to common.
     fn card_budget_out(&self) {
+        {
+            let deferred = self.deferred();
+            if let Some((lent, card)) = &deferred.lent_budget {
+                if *card && deferred.lent_used {
+                    // SAFETY: an open list; the lent buffer is in unordered access.
+                    unsafe {
+                        self.list.ResourceBarrier(&[transition(
+                            lent,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )])
+                    };
+                }
+                return;
+            }
+        }
         if !self.deferred().budget_zeroed {
             return;
         }
@@ -9578,7 +9643,16 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        let cap = {
+            static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *CAP.get_or_init(|| {
+                std::env::var("VICTORY_VIDEO_BUDGET_MB")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map_or(u64::MAX, |mb| mb << 20)
+            })
+        };
+        Some([own.Budget.min(cap), own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for

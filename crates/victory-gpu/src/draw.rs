@@ -357,6 +357,10 @@ fn batches() -> u8 {
     })
 }
 
+pub(crate) fn batches_on() -> bool {
+    batches() > 0
+}
+
 /// The records clamped by the pass opened last ([`batches`]).
 struct Batch {
     table: crate::indirect::batch::Table,
@@ -385,6 +389,16 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// With `crate::indirect::hoisting`: the open host list before this
+    /// one's that takes the clamps of the run of indirect draws recorded now.
+    pub(crate) hoist: Option<crate::indirect::Hoist>,
+    /// Title commands recorded that may write indirect arguments
+    /// (dispatches, copies, resolves, memory writes, draws whose shaders
+    /// store): a run of hoisted clamps ends at the next one.
+    pub(crate) writes: u64,
+    /// The budget the pieces of this title list share since its first run
+    /// of hoisted clamps (`crate::host::HostList::lend_budget`).
+    pub(crate) budget_of: Option<(ID3D12Resource, bool)>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -876,20 +890,34 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+// Per host heap: the host copy and range each slot's buffer view
+// reads, kept from pass to pass. Only the slots written since the
+// last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
+// at best); all of them every 16 passes, because a view of a
+// released resource goes stale without a write, and a slot written
+// before its memory had a host copy is only made then.
+type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+    std::sync::Mutex::new(None);
+
+/// The buffer pass keys its retained copies by the address of the host heap.
+/// Remove them before that address can belong to another heap (fxceless#1276).
+pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    let ranges = RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|heaps| heaps.remove(&key));
+    // Dropping a shadow can release GPU resources. Keep that outside the lock.
+    drop(ranges);
+}
+
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
-    // Per host heap: the host copy and range each slot's buffer view
-    // reads, kept from pass to pass. Only the slots written since the
-    // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 passes, because a view of a
-    // released resource goes stale without a write, and a slot written
-    // before its memory had a host copy is only made then.
-    type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
-    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-        std::sync::Mutex::new(None);
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let (passes, ranges) = kept
         .get_or_insert_with(Default::default)
@@ -1292,6 +1320,8 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.window = None;
+        self.batch = None;
         self.uav_synced = false;
         self.uav_clean = false;
         if self.topology_set {
@@ -2960,6 +2990,17 @@ impl State {
         });
     }
 
+    /// A draw whose shaders store to buffers may write the arguments of a
+    /// later draw: with hoisted clamps it ends the run (`crate::indirect::hoisting`).
+    fn note_stores(&mut self) {
+        if crate::indirect::hoisting()
+            && crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_some_and(|p| p.stages.iter().any(|s| s.translated().stores))
+        {
+            self.writes += 1;
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -3032,6 +3073,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        self.writes += 1;
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3382,6 +3424,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
+                    self.note_stores();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -3937,6 +3980,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.note_stores();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4042,6 +4086,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.note_stores();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4291,8 +4336,31 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        // The run's clamps in the list before (`crate::indirect::hoisting`):
+        // nothing of ours between this list's draws.
+        let mut hoisted = None;
+        if batch.is_none()
+            && hit.is_none()
+            && kind != DISPATCH
+            && !windowed
+            && self.topology != RECTANGLES
+            && let Some(h) = self.hoist.as_mut()
+        {
+            args.refresh(&h.clamps, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(&h.clamps, *at, 4);
+            }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            hoisted = crate::indirect::bound_before(h, (&args.buffer, offset), count_arg, (kind, stride, max));
+        }
         let (bounded, at) = match batch.or(hit) {
             Some(hit) => hit,
+            None if hoisted.is_some() => {
+                let Some((bounded, at)) = hoisted.take() else { unreachable!() };
+                self.window = None;
+                list.keep(&bounded);
+                (bounded, at)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -4392,9 +4460,11 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
+            self.writes += 1;
             self.buffers_written();
         } else {
             self.drew(Some(p));
+            self.note_stores();
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -4912,7 +4982,39 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{HeapRanges, RANGES, staging_budget_per_frame};
+
+    #[test]
+    fn dropping_a_descriptor_heap_releases_buffer_pass_cache() {
+        use crate::descriptor::host::HostHeap;
+        use crate::resource::Memory;
+        use std::sync::Arc;
+
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        let heap = Box::new(HostHeap::new(false, 4).expect("view heap"));
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        let memory = Memory::zeroed(4096, 4096).expect("test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 4096);
+        let copy = crate::shadow::find(start, 4096).expect("host copy");
+        crate::shadow::unregister(start as usize, start);
+        let weak = Arc::downgrade(&copy);
+
+        let mut ranges = HeapRanges(Vec::new());
+        ranges.set(0, Some((copy.clone(), start, start + 4096)));
+        RANGES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(key, (1, ranges));
+        drop(copy);
+        assert!(weak.upgrade().is_some());
+        drop(heap);
+        assert!(weak.upgrade().is_none(), "a freed descriptor heap still owns the buffer copy");
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
