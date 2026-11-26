@@ -1294,8 +1294,8 @@ mod host {
             .collect()
     }
 
-    /// Auto-press A (`Enter` in fallback pad / `A` on pad 0) for the first
-    /// `VICTORY_AUTO_A` seconds after input starts, regardless of focus.
+    /// Auto-press A (`Enter` in fallback pad / `A` on pad 0) from 24 s to
+    /// `VICTORY_AUTO_A` seconds after input starts, skipping `Game Init`, regardless of focus.
     fn auto_a_pressed() -> bool {
         static AUTO_A: LazyLock<(Instant, u64)> = LazyLock::new(|| {
             let secs = std::env::var("VICTORY_AUTO_A")
@@ -1305,11 +1305,12 @@ mod host {
             (Instant::now(), secs)
         });
         let (start, secs) = &*AUTO_A;
-        if *secs == 0 {
+        if *secs <= 24 {
             return false;
         }
         let elapsed = start.elapsed();
-        elapsed.as_secs() < *secs && elapsed.as_millis() % 4000 < 250
+        let s = elapsed.as_secs();
+        (24..*secs).contains(&s) && elapsed.as_millis() % 4000 < 250
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
