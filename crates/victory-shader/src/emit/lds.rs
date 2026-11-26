@@ -247,17 +247,23 @@ pub(super) fn meetings(
                 return None;
             }
         } else if writes[r] && !has_rmw[r] {
-            if has_provable_shared_waw(&region_accesses[r]) {
-                return None;
-            }
-            if region_has_cycle[r]
-                && region_accesses[r].iter().any(|a| {
-                    a.expr
-                        .as_ref()
-                        .is_some_and(|e| e.tid == [0, 0, 0] && e.console_lane == 0)
-                })
-            {
-                return None;
+            // `VICTORY_LDS_WRITE_ONLY_OK=1` restores upstream's write-only shortcut on
+            // Wave32 hosts so non-RMW write-only regions (e.g. GTA 6 skinning passes)
+            // don't fall back to refused Wave64 pipelines.
+            let write_only_ok = std::env::var_os("VICTORY_LDS_WRITE_ONLY_OK").is_some_and(|v| v == "1");
+            if !write_only_ok {
+                if has_provable_shared_waw(&region_accesses[r]) {
+                    return None;
+                }
+                if region_has_cycle[r]
+                    && region_accesses[r].iter().any(|a| {
+                        a.expr
+                            .as_ref()
+                            .is_some_and(|e| e.tid == [0, 0, 0] && e.console_lane == 0)
+                    })
+                {
+                    return None;
+                }
             }
         }
     }

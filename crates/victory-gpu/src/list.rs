@@ -2245,14 +2245,34 @@ pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
                 }
             }
             TYPE_TEXTURE => {
-                // Element 0 has zero stride assumption; for multi-element texture
-                // groups keep conservative UAV barrier until stride is verified.
-                if g.num > 1 {
-                    BARRIER_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return true;
-                }
-                if check_words(g.ptr, true) {
-                    return true;
+                // `D3D12_TEXTURE_BARRIER` is 64 bytes on both PC and Xbox GDK:
+                // 4x u32 sync/access (0..16), 2x u32 layout (16..24),
+                // pResource (24..32), 6x u32 subresources (32..56), Flags u32 (56..60) + 4B pad.
+                const TEX_STRIDE: usize = 64;
+                const _: () = assert!(
+                    std::mem::size_of::<windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_BARRIER>()
+                        == TEX_STRIDE
+                );
+                for j in 0..g.num as usize {
+                    // SAFETY: `g.ptr` points to `g.num` `D3D12_TEXTURE_BARRIER` structs.
+                    let elem = unsafe { g.ptr.add(j * TEX_STRIDE) };
+                    if j > 0 {
+                        // Sanity-check stride alignment on subsequent elements: pResource at +24
+                        // must be non-null & 8-byte aligned and Flags at +56 <= 3.
+                        let (res_ptr, flags) = unsafe {
+                            (
+                                elem.add(24).cast::<u64>().read_unaligned(),
+                                elem.add(56).cast::<u32>().read_unaligned(),
+                            )
+                        };
+                        if res_ptr == 0 || (res_ptr & 7) != 0 || flags > 3 {
+                            BARRIER_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return true;
+                        }
+                    }
+                    if check_words(elem, true) {
+                        return true;
+                    }
                 }
             }
             _ => return true,
@@ -2641,5 +2661,21 @@ mod tests {
         let glob_noop: [u32; 4] = [0, 128, 0x8000_0000, 0x10];
         let g5 = [Group { kind: 0, num: 1, ptr: glob_noop.as_ptr().cast() }];
         assert!(!groups_need_uav(1, g5.as_ptr().cast()));
+
+        // Multi-element (2 x 64-byte) pure non-UAV texture barriers: no UAV needed.
+        let mut tex_multi_clean = [0u32; 32];
+        // Element 0: RTV -> SRV, pResource = 0x1000
+        tex_multi_clean[0..4].copy_from_slice(&[64, 16, 8, 128]);
+        tex_multi_clean[6] = 0x1000;
+        // Element 1 (at dword 16 = byte 64): DSV -> SRV, pResource = 0x2000, Flags = 0
+        tex_multi_clean[16..20].copy_from_slice(&[32, 16, 32, 128]);
+        tex_multi_clean[22] = 0x2000;
+        let g6 = [Group { kind: 1, num: 2, ptr: tex_multi_clean.as_ptr().cast() }];
+        assert!(!groups_need_uav(1, g6.as_ptr().cast()));
+
+        // Multi-element where element 1 has UAV access: must emit UAV barrier.
+        tex_multi_clean[18] = 0x10; // ACCESS_UNORDERED_ACCESS
+        let g7 = [Group { kind: 1, num: 2, ptr: tex_multi_clean.as_ptr().cast() }];
+        assert!(groups_need_uav(1, g7.as_ptr().cast()));
     }
 }

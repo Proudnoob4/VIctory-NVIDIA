@@ -312,6 +312,18 @@ pub fn rdna_float() -> u32 {
     })
 }
 
+/// Fast float lowering on non-RDNA (NVIDIA/Intel) hosts (`VICTORY_NV_FLOAT`,
+/// bitmask of [`rdna`] bits: 1 MAX_MIN, 2 LEGACY, 4 MED3, 8 FRACT; 0 when unset
+/// so strict IEEE signed-zero tests stay exact). Part of [`lower::host_rdna`],
+/// so the shader cache keys on it automatically.
+pub fn nv_float() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_NV_FLOAT").ok();
+        parse_set(value.as_deref(), 0, rdna::ALL)
+    })
+}
+
 /// The bits of [`rdna_float`].
 pub mod rdna {
     /// `v_max_f32` and the like: the host's FMax and FMin, without the code

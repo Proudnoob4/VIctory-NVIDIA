@@ -352,6 +352,11 @@ struct Lower<'a> {
     fence_only: HashSet<usize>,
     /// A group barrier before every LDS access (a console wave run as two host waves).
     split_lds: bool,
+    /// Per-block LDS sync tracking for `split_lds` coalescing:
+    /// 0 = dirty (need barrier before next LDS access),
+    /// 1 = clean (just ran a group sync barrier),
+    /// 2 = read-only (synced and only `ds_read*` since; consecutive reads need no barrier).
+    lds_synced: u8,
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
@@ -1507,13 +1512,25 @@ thread_local! {
     pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether `split_lds` coalesces consecutive `ds_read*` barriers and skips a
+/// redundant barrier right after a threadgroup-synced `s_barrier` or `lds_meeting`
+/// (`VICTORY_SPLIT_LDS_COALESCE=0` emits a barrier before every LDS access as before).
+fn split_lds_coalesce() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_LDS_COALESCE").is_none_or(|v| v != "0"))
+}
+
 /// The bits of [`super::rdna`] that count on this host.
 pub(super) fn host_rdna() -> u32 {
     #[cfg(test)]
     if let Some(bits) = TEST_RDNA.get() {
         return bits;
     }
-    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) {
+        super::rdna_float()
+    } else {
+        super::nv_float()
+    }
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -2160,6 +2177,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             split_lds,
+            lds_synced: 0,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
@@ -2864,6 +2882,7 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.lds_synced = 0;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -5785,16 +5804,33 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        let cur_before = self.cur;
         if self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // the two host waves of a console wave meet before LDS accesses: what the other
+            // half wrote is visible, and what it still reads is not overwritten.
+            // With `split_lds_coalesce`: consecutive `ds_read*` after a barrier have no
+            // inter-half hazard, and the first LDS op right after a group-synced `s_barrier`
+            // or `lds_meeting` is already synchronized.
+            let is_read = name.starts_with("ds_read");
+            let need_barrier = if split_lds_coalesce() {
+                if is_read {
+                    self.lds_synced == 0
+                } else {
+                    self.lds_synced != 1
+                }
+            } else {
+                true
+            };
+            if need_barrier {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            }
+            self.lds_synced = if is_read { 2 } else { 0 };
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5817,7 +5853,7 @@ impl<'a> Lower<'a> {
                 let setting = super::group_sync();
                 let divergent = self.fence_only.contains(&b);
                 let group_threads = self.s.threads.map(|t| t.iter().product());
-                let mode = barrier_mode(
+                let mode_val = barrier_mode(
                     setting,
                     host_max_wave(),
                     self.wave(),
@@ -5825,10 +5861,13 @@ impl<'a> Lower<'a> {
                     divergent,
                     self.writes_uavs,
                 );
-                let mode = self.s.m.i32(mode);
+                let mode = self.s.m.i32(mode_val);
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                if mode_val & 1 != 0 && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b]) {
+                    self.lds_synced = 1;
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -5855,6 +5894,9 @@ impl<'a> Lower<'a> {
         if ordered && r.is_ok() {
             self.memory_fence();
         }
+        if self.cur != cur_before {
+            self.lds_synced = 0;
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -5879,6 +5921,7 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.lds_synced = 1;
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
