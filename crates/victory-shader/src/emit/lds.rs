@@ -164,6 +164,7 @@ pub(super) fn meetings(
     let ctx = AddrCtx::new(p, st, io, res, cs, all);
     let mut region_accesses: Vec<Vec<Access>> = vec![Vec::new(); n];
     let mut reads = vec![false; n];
+    let mut has_plain_read = vec![false; n];
     let mut writes = vec![false; n];
     let mut has_rmw = vec![false; n];
     let mut has_unknown = vec![false; n];
@@ -190,6 +191,9 @@ pub(super) fn meetings(
                     reads[r] = true;
                 }
                 DsClass::One { kind, off, width } => {
+                    if kind == Kind::Read {
+                        has_plain_read[r] = true;
+                    }
                     record_kind(&mut reads[r], &mut writes[r], &mut has_rmw[r], kind);
                     let expr = ctx.resolve_ds_addr(inst, b, off, width);
                     region_accesses[r].push(Access {
@@ -204,6 +208,9 @@ pub(super) fn meetings(
                     off1,
                     width,
                 } => {
+                    if kind == Kind::Read {
+                        has_plain_read[r] = true;
+                    }
                     record_kind(&mut reads[r], &mut writes[r], &mut has_rmw[r], kind);
                     let e0 = ctx.resolve_ds_addr(inst, b, off0, width);
                     let e1 = ctx.resolve_ds_addr(inst, b, off1, width);
@@ -222,6 +229,7 @@ pub(super) fn meetings(
         }
     }
 
+    let write_only_ok = std::env::var_os("VICTORY_LDS_WRITE_ONLY_OK").is_some_and(|v| v == "1");
     for r in 0..n {
         if region[r] != r {
             continue;
@@ -231,26 +239,27 @@ pub(super) fn meetings(
         }
         if reads[r] && writes[r] {
             // Cyclic `!all` regions lack an in-loop barrier, so Refinement A cannot prevent
-            // cross-iteration RAW/WAR/WAW between host halves; only lane-private slots or
-            // monotonic flag regions (`VICTORY_LDS_FLAGS`) are safe.
+            // cross-iteration RAW/WAR/WAW between host halves; only lane-private slots,
+            // monotonic flag regions (`VICTORY_LDS_FLAGS`), or opt-in no-`ds_read` atomic-only
+            // write regions (`VICTORY_LDS_WRITE_ONLY_OK=1`, matching upstream `lds_meetings`)
+            // are accepted.
             let disjoint_ok = !region_has_cycle[r] && region_disjoint_ranges(&region_accesses[r]);
-            let safe = disjoint_ok || region_lane_private(&region_accesses[r], cs.threads) || {
-                let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
-                if flags_on {
-                    let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
-                    super::lower::lds_flag_region(p, st, &blocks)
-                } else {
-                    false
-                }
-            };
+            let safe = disjoint_ok
+                || region_lane_private(&region_accesses[r], cs.threads)
+                || (write_only_ok && !has_plain_read[r])
+                || {
+                    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+                    if flags_on {
+                        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+                        super::lower::lds_flag_region(p, st, &blocks)
+                    } else {
+                        false
+                    }
+                };
             if !safe {
                 return None;
             }
         } else if writes[r] && !has_rmw[r] {
-            // `VICTORY_LDS_WRITE_ONLY_OK=1` restores upstream's write-only shortcut on
-            // Wave32 hosts so non-RMW write-only regions (e.g. GTA 6 skinning passes)
-            // don't fall back to refused Wave64 pipelines.
-            let write_only_ok = std::env::var_os("VICTORY_LDS_WRITE_ONLY_OK").is_some_and(|v| v == "1");
             if !write_only_ok {
                 if has_provable_shared_waw(&region_accesses[r]) {
                     return None;
