@@ -589,12 +589,16 @@ pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// host texture is made here if it is not yet, as [`make`] would.
 fn begun_before(view: &View) -> Option<u64> {
     // (Resolved first: the texture made here, a moment ago, is the case.)
+    let placed;
     let shader = match view {
-        View::Placed(false, resource, _) if resource[0] != 1 => placed_texture(view)?,
-        View::Shader(..) => view.clone(),
+        View::Placed(false, resource, _) if resource[0] != 1 => {
+            placed = placed_texture(view)?;
+            &placed.view
+        }
+        View::Shader(..) => view,
         _ => return None,
     };
-    let View::Shader(resource, _) = shader else {
+    let View::Shader(resource, _) = *shader else {
         return None;
     };
     let texture = crate::resource::host_resource(resource as crate::object::This)?;
