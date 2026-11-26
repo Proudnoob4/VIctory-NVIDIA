@@ -833,6 +833,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    // Open any guarded title aliases before writing through our own views (Marvisak#3037).
+    let _writing: Vec<victory_gpu::KernelWrite> = shown_at(pages, offset, data.len())
+        .into_iter()
+        .map(|(at, len)| victory_gpu::kernel_writing(at, len))
+        .collect();
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let k = (n * PAGE - within).min(data.len() - done);
@@ -858,6 +863,8 @@ pub(crate) struct PageWindow {
     view: Window,
     within: usize,
     len: usize,
+    /// Write-watch guards held open while the window is live (Marvisak#3037).
+    _writing: Vec<victory_gpu::KernelWrite>,
 }
 
 enum Window {
@@ -893,10 +900,15 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         Some(at) => Window::Kept(at, slice.section.clone()),
         None => Window::Own(View::map(slice, *n)?),
     };
+    let _writing: Vec<victory_gpu::KernelWrite> = shown_at(pages, offset, len)
+        .into_iter()
+        .map(|(at, len)| victory_gpu::kernel_writing(at, len))
+        .collect();
     Some(PageWindow {
         view,
         within: offset % PAGE,
         len,
+        _writing,
     })
 }
 

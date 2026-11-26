@@ -3364,6 +3364,33 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// [`land`] at the end of a submission, on a thread of its own with
+/// `VICTORY_LAND_ASIDE=1` (off by default): moves host command-list allocator
+/// resets off the submitting thread (ported from fxceless/victory-fork#1146).
+fn land_after_submission() {
+    static ASIDE: OnceLock<Option<std::sync::mpsc::Sender<()>>> = OnceLock::new();
+    let aside = ASIDE.get_or_init(|| {
+        if !std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1") {
+            return None;
+        }
+        let (send, asked) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("victory-land".to_owned())
+            .spawn(move || {
+                while asked.recv().is_ok() {
+                    while asked.try_recv().is_ok() {}
+                    land();
+                }
+            })
+            .ok()
+            .map(|_| send)
+    });
+    match aside {
+        Some(send) if send.send(()).is_ok() => {}
+        _ => land(),
+    }
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -5376,7 +5403,7 @@ impl Host {
         }
         drop(submitted);
         let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -8352,6 +8379,35 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_as(dst, src, len, title_dst, false);
+}
+
+/// [`copy_mapped`] of title memory into a host copy's CPU side, which the CPU
+/// does not read again soon: many bytes go with streaming stores
+/// ([`crate::safecopy::copy_streaming`]; `VICTORY_STREAM_REFRESH=0`: as
+/// [`copy_mapped`]). What fails is copied again as [`copy_mapped`] does.
+pub(crate) fn copy_streamed(dst: *mut u8, src: *const u8, len: usize) {
+    // Below a page the head and tail are most of it, and a plain copy may
+    // find the lines in the cache.
+    const FEW: usize = 4096;
+    copy_mapped_as(dst, src, len, false, len >= FEW && stream_refresh());
+}
+
+/// Whether [`copy_streamed`] streams.
+fn stream_refresh() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_STREAM_REFRESH") {
+        return on && crate::safecopy::on();
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::safecopy::on()
+            && std::is_x86_feature_detected!("avx2")
+            && std::env::var_os("VICTORY_STREAM_REFRESH").is_none_or(|v| v != "0")
+    })
+}
+
+fn copy_mapped_as(dst: *mut u8, src: *const u8, len: usize, title_dst: bool, stream: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8387,7 +8443,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let since = crate::watch::changes();
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    let first = if stream {
+        // SAFETY: the destination is a host copy's mapped CPU side of `len`
+        // bytes; a source page that is not there fails the copy.
+        unsafe { crate::safecopy::copy_streaming(dst, src, len) }
+    } else {
+        read(src, dst, len)
+    };
+    let whole = first || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
