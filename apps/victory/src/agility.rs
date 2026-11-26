@@ -5,8 +5,12 @@
 //! which every translated pipeline uses. D3D12 looks for these two exports on
 //! the process's executable; when they name a runtime newer than the
 //! system's, it loads `D3D12Core.dll` from `D3D12SDKPath` (relative to the
-//! executable) instead. `cargo xtask agility` puts it there. Without the
-//! folder, or on a system whose runtime is newer, the in-box one is used.
+//! executable) instead. Nothing in this tree fetches it: copy `D3D12Core.dll`
+//! and `d3d12SDKLayers.dll` from the `Microsoft.Direct3D.D3D12` 1.620.x NuGet
+//! package into `D3D12\` beside `victory.exe`. Without that folder device
+//! creation fails (`0x887E0003`, fxceless/victory-fork#1319) whenever 620
+//! is newer than the system's runtime; on a system whose runtime is newer,
+//! the in-box one is used.
 //!
 //! `build.rs` exports both symbols.
 #![allow(non_upper_case_globals)]
