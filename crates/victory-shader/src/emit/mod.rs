@@ -149,6 +149,27 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+thread_local! {
+    /// The loop limit of the translation running on this thread, if its
+    /// caller named one ([`with_loop_limit`]).
+    static LIMIT_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) with every loop of it stopped after `limit`
+/// iterations per entry, whatever the stage, where `limit` is given; else
+/// with [`loop_limit`]'s. The caller keys its cache of translations on it.
+pub fn with_loop_limit<R>(limit: Option<u32>, f: impl FnOnce() -> R) -> R {
+    let was = LIMIT_HERE.with(|l| l.replace(limit));
+    let out = f();
+    LIMIT_HERE.with(|l| l.set(was));
+    out
+}
+
+/// The loop limit the translation on this thread uses ([`with_loop_limit`]).
+pub(crate) fn loop_limit_here() -> u32 {
+    LIMIT_HERE.with(std::cell::Cell::get).unwrap_or_else(loop_limit)
+}
+
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
 /// the shader cache keys on it.
@@ -2974,5 +2995,20 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A loop limit named for one translation holds on its thread for that
+    /// translation only, and comes back to the stage limits after it.
+    #[test]
+    fn a_named_loop_limit_holds_for_its_translation_only() {
+        let normal = super::loop_limit_here();
+        assert_eq!(super::with_loop_limit(Some(512), super::loop_limit_here), 512);
+        assert_eq!(super::with_loop_limit(None, super::loop_limit_here), normal);
+        assert_eq!(super::with_loop_limit(Some(7), || super::with_loop_limit(Some(9), super::loop_limit_here)), 9);
+        assert_eq!(super::loop_limit_here(), normal);
+        // Another thread is not told.
+        super::with_loop_limit(Some(33), || {
+            assert_eq!(std::thread::spawn(super::loop_limit_here).join().unwrap(), normal);
+        });
     }
 }
