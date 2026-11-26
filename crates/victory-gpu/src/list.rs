@@ -789,9 +789,16 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
-            host.push(UAV_BARRIER);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            let mut emit = true;
+            with_state(this, |_, state| { emit = state.take_uav_barrier(); });
+            if emit {
+                host.push(UAV_BARRIER);
+                BARRIER_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            } else {
+                BARRIER_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -1558,7 +1565,17 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        with_state(this, |_, state| state.synced());
+        if skip_sync() && !crate::pipeline::builder_runs() {
+            with_state(this, |_, state| state.synced());
+            BARRIER_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let mut emit = true;
+        with_state(this, |_, state| { emit = state.take_uav_barrier(); });
+        if !emit {
+            BARRIER_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
@@ -1579,6 +1596,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
+            BARRIER_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
@@ -2132,33 +2150,163 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Per-frame global UAV barrier counters:
+/// [0] emitted, [1] skipped_dedup, [2] skipped_smart, [3] skipped_sync,
+/// [4] skipped_indirect_uav, [5] tex_multi_groups_kept.
+#[cfg(windows)]
+pub(crate) static BARRIER_STATS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// `VICTORY_SMART_BARRIERS=0` disables inspecting `D3D12_BARRIER_GROUP` structs
+/// in `barrier_groups` (emits a global UAV barrier for every call, as before).
+#[cfg(windows)]
+fn smart_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SMART_BARRIERS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_SKIP_SYNC=1`: skip emitting a global UAV barrier on `sync()` when
+/// the ray-tracing structure builder is off (opt-in; off by default).
+#[cfg(windows)]
+fn skip_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_SYNC").is_some_and(|v| v == "1"))
+}
+
+/// Inspects `count` 16-byte `D3D12_BARRIER_GROUP` entries `(type, num, ptr)` to
+/// determine whether a host global UAV barrier is needed. Pure non-UAV texture
+/// layout transitions (which our host list already tracks explicitly) and
+/// `SYNC_NONE` / `NO_ACCESS` barriers do not require flushing every shader SM.
+#[cfg(windows)]
+pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
+    if count == 0 {
+        return false;
+    }
+    if !smart_barriers() || groups.is_null() {
+        return true;
+    }
+    const TYPE_GLOBAL: u32 = 0;
+    const TYPE_TEXTURE: u32 = 1;
+    const TYPE_BUFFER: u32 = 2;
+    const SYNC_NONE: u32 = 0;
+    const ACCESS_COMMON: u32 = 0;
+    const ACCESS_UAV: u32 = 0x10;
+    const ACCESS_NO_ACCESS: u32 = 0x8000_0000;
+    const WRITE_ACCESS: u32 = 0x10 | 0x100 | 0x400 | 0x8000; // UAV | SO | COPY_DEST | RT_AS_WRITE
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Group {
+        kind: u32,
+        num: u32,
+        ptr: *const u8,
+    }
+
+    let check_words = |p: *const u8, tex_only: bool| -> bool {
+        // SAFETY: caller verified non-null barrier array entry.
+        let (sb, sa, ab, aa) = unsafe {
+            let w = p.cast::<u32>();
+            (w.read_unaligned(), w.add(1).read_unaligned(), w.add(2).read_unaligned(), w.add(3).read_unaligned())
+        };
+        if sb == SYNC_NONE || sa == SYNC_NONE || ab == ACCESS_NO_ACCESS || aa == ACCESS_NO_ACCESS {
+            return false;
+        }
+        if tex_only {
+            ab == ACCESS_COMMON || aa == ACCESS_COMMON || (ab & ACCESS_UAV) != 0 || (aa & ACCESS_UAV) != 0
+        } else {
+            ab == ACCESS_COMMON || aa == ACCESS_COMMON || (ab & WRITE_ACCESS) != 0 || (aa & ACCESS_UAV) != 0
+        }
+    };
+
+    // SAFETY: title passed `count` 16-byte barrier groups.
+    let slice = unsafe { std::slice::from_raw_parts(groups.cast::<Group>(), count as usize) };
+    for g in slice {
+        if g.num == 0 {
+            continue;
+        }
+        if g.ptr.is_null() {
+            return true;
+        }
+        match g.kind {
+            TYPE_GLOBAL => {
+                for j in 0..g.num as usize {
+                    // SAFETY: `D3D12_GLOBAL_BARRIER` is 16 bytes.
+                    if check_words(unsafe { g.ptr.add(j * 16) }, false) {
+                        return true;
+                    }
+                }
+            }
+            TYPE_BUFFER => {
+                for j in 0..g.num as usize {
+                    // SAFETY: `D3D12_BUFFER_BARRIER` is 40 bytes (list.rs:2338).
+                    if check_words(unsafe { g.ptr.add(j * 40) }, false) {
+                        return true;
+                    }
+                }
+            }
+            TYPE_TEXTURE => {
+                // Element 0 has zero stride assumption; for multi-element texture
+                // groups keep conservative UAV barrier until stride is verified.
+                if g.num > 1 {
+                    BARRIER_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return true;
+                }
+                if check_words(g.ptr, true) {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    #[cfg(windows)]
+    {
+        let needs = groups_need_uav(count, groups);
+        barrier_groups_checked(this, count, needs);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, count, groups);
+}
+
+#[cfg(windows)]
+pub(crate) fn barrier_groups_checked(this: This, count: u32, needs_uav: bool) {
+    if count == 0 {
+        return;
+    }
+    if !needs_uav {
+        BARRIER_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if count > 0 {
+    #[cfg(feature = "diagnostics")]
+    {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
     }
-    #[cfg(windows)]
-    if count > 0
-        && let Some(list) = host_list(this)
-    {
+    if let Some(list) = host_list(this) {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        with_state(this, |_, state| state.synced());
+        let mut emit = true;
+        with_state(this, |_, state| { emit = state.take_uav_barrier(); });
+        if !emit {
+            BARRIER_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        BARRIER_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.barriers(&[barrier]) };
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2446,5 +2594,52 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn groups_need_uav_skips_pure_texture_and_noop_barriers() {
+        #[repr(C)]
+        struct Group {
+            kind: u32,
+            num: u32,
+            ptr: *const u8,
+        }
+        // Pure RTV -> SRV texture transition: no UAV needed.
+        let tex_rtv_to_srv: [u32; 16] = [
+            64,   // SYNC_RENDER_TARGET
+            16,   // SYNC_PIXEL_SHADING
+            8,    // ACCESS_RENDER_TARGET
+            128,  // ACCESS_SHADER_RESOURCE
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let g1 = [Group { kind: 1, num: 1, ptr: tex_rtv_to_srv.as_ptr().cast() }];
+        assert!(!groups_need_uav(1, g1.as_ptr().cast()));
+
+        // Texture barrier with UAV access before: needs UAV barrier.
+        let tex_uav: [u32; 16] = [
+            128,  // SYNC_COMPUTE_SHADING
+            16,   // SYNC_PIXEL_SHADING
+            0x10, // ACCESS_UNORDERED_ACCESS
+            128,  // ACCESS_SHADER_RESOURCE
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let g2 = [Group { kind: 1, num: 1, ptr: tex_uav.as_ptr().cast() }];
+        assert!(groups_need_uav(1, g2.as_ptr().cast()));
+
+        // Read-only buffer barrier (SRV -> VERTEX_BUFFER): no UAV needed.
+        let buf_ro: [u32; 10] = [128, 8, 128, 1, 0, 0, 0, 0, 0, 0];
+        let g3 = [Group { kind: 2, num: 1, ptr: buf_ro.as_ptr().cast() }];
+        assert!(!groups_need_uav(1, g3.as_ptr().cast()));
+
+        // Buffer UAV -> SRV barrier: needs UAV barrier.
+        let buf_uav: [u32; 10] = [128, 128, 0x10, 128, 0, 0, 0, 0, 0, 0];
+        let g4 = [Group { kind: 2, num: 1, ptr: buf_uav.as_ptr().cast() }];
+        assert!(groups_need_uav(1, g4.as_ptr().cast()));
+
+        // SYNC_NONE / NO_ACCESS global barrier: no UAV needed.
+        let glob_noop: [u32; 4] = [0, 128, 0x8000_0000, 0x10];
+        let g5 = [Group { kind: 0, num: 1, ptr: glob_noop.as_ptr().cast() }];
+        assert!(!groups_need_uav(1, g5.as_ptr().cast()));
     }
 }

@@ -395,35 +395,46 @@ fn validate_layout(
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
 /// available.
+#[cfg(test)]
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    bound_uav(list, src, count, spec, true)
 }
 
-/// [`bound`] for a window of records clamped ahead of the draws that will
-/// read them (`crate::draw`'s windows; no count buffer). The records past
-/// the ones the title filled are whatever the buffer holds, and each
-/// record clamped charges the list's budget when it is clamped: a slot of
-/// all ones, clamped to the most a mesh dispatch runs (65,535 groups),
-/// charged a sixteenth of the budget, so sixteen of them emptied every
-/// draw of the list after them (run 93: "the largest group count asked for
-/// 4294967295", 43 to 153 such records a frame). Here a record that asks
-/// for more than can run is left empty and charges nothing; a record
-/// clamped alone is clamped and charged as before.
+pub(crate) fn bound_uav(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    need_uav: bool,
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, count, spec, false, need_uav).then_some(dst)
+}
+
+#[cfg(test)]
 pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
+    bound_ahead_uav(list, src, spec, true)
+}
+
+pub(crate) fn bound_ahead_uav(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    need_uav: bool,
+) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, true, need_uav).then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -439,13 +450,29 @@ fn clamp_into(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
+    need_uav: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_as_uav(c, &list.list, (dst, before), budget, src, count, spec, ahead, need_uav);
     if recorded {
         list.indirect_readable(dst);
     }
     recorded
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_as(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_as_uav(c, l, dst, budget, src, count, spec, ahead, true)
 }
 
 /// Records the clamp into `dst`, which is in state `before` (common, or
@@ -454,7 +481,7 @@ fn clamp_into(
 /// their draws ([`bound_ahead`]). False, with nothing recorded, if the
 /// layout or the addresses do not fit the clamp.
 #[allow(clippy::too_many_arguments)]
-fn record_clamp_as(
+fn record_clamp_as_uav(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
@@ -463,6 +490,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    need_uav: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -519,21 +547,18 @@ fn record_clamp_as(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
+    let waits = need_uav && crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = need_uav;
     let first = [
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
-    let second = [
-        uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
+    let after = transition(
+        dst,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    );
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -548,7 +573,9 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        // Only the clamped argument buffer `dst` needs ordering before the
+        // indirect draw reads it (matching `batch::record`).
+        l.ResourceBarrier(&[after]);
     }
     true
 }
@@ -580,6 +607,7 @@ pub(crate) fn open_batch(
     list: &HostList,
     source: (u64, &ID3D12Resource),
     recent: &[(u64, ID3D12Resource)],
+    need_uav: bool,
 ) -> Option<(batch::Table, ID3D12Resource)> {
     let c = batch_clamp()?;
     let budget = list.budget()?;
@@ -604,7 +632,9 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    #[cfg(feature = "diagnostics")]
+    let need_uav = need_uav && crate::copystat::barrier_test() & 2 == 0;
+    batch::record_uav(c, &list.list, (&dst, before), budget, sources, jobs, need_uav);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -3239,7 +3269,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             // More batches than one scratch buffer holds.
             for k in 0..12u32 {
                 let (mut table, scratch) =
-                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())]).unwrap();
+                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())], true).unwrap();
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.
                 unsafe {

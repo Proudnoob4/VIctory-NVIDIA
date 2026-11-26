@@ -325,6 +325,9 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// True after a global NULL UAV barrier was emitted with no draw, dispatch,
+    /// or copy recorded since (avoids back-to-back full-GPU pipeline drains).
+    uav_synced: bool,
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -1159,6 +1162,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.uav_synced = false;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -3727,10 +3731,18 @@ impl State {
     }
 }
 
+/// `VICTORY_DEDUP_BARRIERS=0` disables skipping redundant back-to-back global
+/// UAV barriers when no draw, dispatch, or copy ran since the previous one.
+fn dedup_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEDUP_BARRIERS").is_none_or(|v| v != "0"))
+}
+
 impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
     fn buffers_written(&mut self) {
+        self.uav_synced = false;
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
@@ -3740,6 +3752,7 @@ impl State {
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
+        self.uav_synced = false;
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             self.batch = None;
         }
@@ -3747,6 +3760,7 @@ impl State {
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
+        self.uav_synced = false;
         self.window = None;
         self.batch = None;
     }
@@ -3756,6 +3770,18 @@ impl State {
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
             self.batch = None;
         }
+    }
+
+    /// Marks the list synced and returns whether a host global UAV barrier
+    /// still needs to be emitted (false if one was just emitted with no work
+    /// recorded since).
+    pub(crate) fn take_uav_barrier(&mut self) -> bool {
+        self.synced();
+        if dedup_barriers() && self.uav_synced {
+            return false;
+        }
+        self.uav_synced = true;
+        true
     }
 
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
@@ -3773,6 +3799,7 @@ impl State {
         // Another host list, or this one after its reset ([`windows`]).
         if list.first_use(BATCH_USE) {
             self.batch = None;
+            self.uav_synced = false;
         }
         // A draw after dispatches waits for them.
         if kind != DISPATCH {
@@ -3785,7 +3812,12 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        let need_uav = !(dedup_barriers() && self.uav_synced);
+        if !need_uav {
+            crate::list::BARRIER_STATS[4].fetch_add(1, Ordering::Relaxed);
+        }
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args), need_uav)?;
+        self.uav_synced = false;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
@@ -3951,11 +3983,16 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                let need_uav = !(dedup_barriers() && self.uav_synced);
+                if !need_uav {
+                    crate::list::BARRIER_STATS[4].fetch_add(1, Ordering::Relaxed);
+                }
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead_uav(list, (&args.buffer, offset), (kind, step, records), need_uav)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound_uav(list, (&args.buffer, offset), count_arg, (kind, step, records), need_uav)
                 };
+                self.uav_synced = false;
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
