@@ -134,6 +134,8 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// The quiet blocks of title memory (`VICTORY_ASK_QUIET`, [`ask_once_quiet`]), by number.
+    quiet: BTreeMap<usize, Quiet>,
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -148,6 +150,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    quiet: BTreeMap::new(),
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
@@ -533,21 +536,244 @@ pub(crate) fn once() -> bool {
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
+/// [`ask_once_end`]. With [`quiet_frames`], the quiet blocks among them are
+/// asked about once a frame ([`ask_once_quiet`]).
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    ask_submission(ranges, &[], quiet_frames());
+}
+
+/// [`ask_once`] with `textures`: the title memory of the textures the lists check
+/// ([`textures_join`]) is merged into the same pass, so a texture near a buffer is
+/// answered from this asking; a texture alone is left to its own check, as before.
+/// With [`quiet_frames`], quiet blocks are asked about once a frame ([`ask_once_quiet`]),
+/// and textures outside those covered blocks are left to their own checks.
+pub(crate) fn ask_once_with(ranges: &[(usize, usize)], textures: &[(usize, usize)]) {
+    ask_submission(ranges, textures, quiet_frames());
+}
+
+/// [`ask_once`] again, all of it, for what the flights landed (the settle
+/// paths): what came to be written since the frame's asking must be seen, so
+/// the quiet blocks are asked about too.
+pub(crate) fn ask_again(ranges: &[(usize, usize)]) {
+    ask_submission(ranges, &[], 0);
+}
+
+fn ask_submission(ranges: &[(usize, usize)], textures: &[(usize, usize)], keep: u64) {
     if !once() {
         return;
     }
     let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
-    // Both parts under one hold of everything: a second hold waited for the
-    // other threads' askings again (0.5 ms a time, run fills-ab3), and no
-    // other asking comes between the two parts.
-    let _all = Asking::hold_all();
-    ask_ahead_held(ranges, true);
-    spent.next("asking: the rest");
-    ask_rest(ranges, true);
+    if keep > 0 {
+        ask_once_quiet(ranges, crate::queue::presented(), keep);
+    } else {
+        // Both parts under one hold of everything: a second hold waited for the
+        // other threads' askings again (0.5 ms a time, run fills-ab3), and no
+        // other asking comes between the two parts.
+        let _all = Asking::hold_all();
+        if textures.is_empty() {
+            ask_ahead_held(ranges, true);
+        } else {
+            let merged: Vec<(usize, usize)> = ranges.iter().chain(textures).copied().collect();
+            ask_ahead_held(&merged, true);
+        }
+        spent.next("asking: the rest");
+        ask_rest(ranges, true);
+    }
     spent.end();
+}
+
+/// Pages of a quiet block: 1 MiB.
+const QUIET_BLOCK: usize = (1 << 20) / PAGE;
+/// Quiet blocks this close (32 MiB) are asked about in one call: the kernel walks the clean pages
+/// between them in less time than another call takes.
+const QUIET_GAP: usize = 32;
+/// Quiet blocks one asking covers at most (1 GiB, as [`AHEAD_MAX`]).
+const QUIET_MOST: usize = (1 << 30) / (1 << 20);
+
+/// Of a quiet block: the frame it was last asked about whole (`u64::MAX`: never), the last frame
+/// a written page was found in it (`u64::MAX`: never), and whether asking about it whole fails
+/// (it is not all inside one write-watched reservation).
+#[derive(Clone, Copy)]
+struct Quiet {
+    asked: u64,
+    written: u64,
+    partial: bool,
+}
+
+const NEVER: Quiet = Quiet { asked: u64::MAX, written: u64::MAX, partial: false };
+
+/// `VICTORY_ASK_QUIET=<frames>` (0 or unset: off): the frames of [`ask_once_quiet`].
+pub(crate) fn quiet_frames() -> u64 {
+    static FRAMES: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("VICTORY_ASK_QUIET").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    *FRAMES
+}
+
+/// Since the last frame line, with [`quiet_frames`]: quiet blocks asked about as the first of their
+/// frame, blocks asked about again as written lately, ranges answered from the journal, and ranges
+/// asked about on their own.
+static QUIET: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn tally_quiet(what: usize, n: u64) {
+    QUIET[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`QUIET`], taken, for the frame line: `frames` frames since the last.
+pub(crate) fn quiet_line(frames: f64) -> String {
+    let [first, lately, journal, alone] = [0, 1, 2, 3].map(|i| {
+        QUIET[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
+    });
+    format!(
+        "title memory asked about per frame (VICTORY_ASK_QUIET={}): {first:.0} quiet blocks of 1 MiB asked about as the first of their frame, {lately:.0} blocks again as written lately; {journal:.0} ranges answered from the journal, {alone:.0} asked about on their own",
+        quiet_frames()
+    )
+}
+
+/// `VICTORY_ASK_QUIET=<frames>` (0 or unset: off; needs [`once`]): memory that nothing was found
+/// written in for that many frames is asked about once a frame, not once a submission.
+///
+/// (Neptune VE's `VICTORY_ASK_QUIET`, by Traffic & imgone and zm0kie, ported onto this journal
+/// via `@zocram4cc`.) A frame's submissions ask about the ranges their lists refresh, mostly the
+/// same ones again: thousands of kernel askings a frame, each walking its pages. Title memory is
+/// taken here in blocks of 1 MiB, each asked about whole. A block in which a written page was found
+/// within the last `keep` frames is asked about at every submission that refreshes part of it, as
+/// before; any other at the first such submission of a frame. The journal answers for the rest of
+/// the frame.
+///
+/// What changes: a write into a quiet block that comes after its asking in a frame is seen by the
+/// next frame's asking, not by the refreshes of the same frame. A copy refreshed in between keeps
+/// the bytes it had: at most one frame (one Present) stale, in a block not written lately. The
+/// settle paths ([`ask_again`]) ask about everything.
+fn ask_once_quiet(ranges: &[(usize, usize)], frame: u64, keep: u64) {
+    let _all = Asking::hold_all();
+    let pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| {
+            r.0 < r.1
+                && !published(r.0, r.1)
+                && !(light() && PROTECTED.any(r.0 / PAGE, r.1.div_ceil(PAGE)))
+        })
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    // The blocks to ask about: not asked about this frame, or written lately.
+    let mut wanted = BTreeSet::new();
+    {
+        let mut j = journal_mut();
+        j.kept = false;
+        j.ahead.clear();
+        for &(first, last) in &pieces {
+            for block in quiet_blocks(first, last) {
+                let q = *j.quiet.entry(block).or_insert(NEVER);
+                let lately = q.written != u64::MAX && frame.wrapping_sub(q.written) <= keep;
+                if !q.partial && (q.asked != frame || lately) && wanted.insert(block) {
+                    tally_quiet(usize::from(lately), 1);
+                }
+            }
+        }
+    }
+    // The kernel is asked without the journal's lock, under the hold of the whole (`ask_rest`).
+    let wanted: Vec<usize> = wanted.into_iter().collect();
+    let (mut found, mut asked, mut partial) = (Vec::new(), Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < wanted.len() {
+        let mut k = i + 1;
+        while k < wanted.len()
+            && wanted[k] <= wanted[k - 1] + 1 + QUIET_GAP
+            && wanted[k] - wanted[i] < QUIET_MOST
+        {
+            k += 1;
+        }
+        let run = &wanted[i..k];
+        if !ask_blocks(run[0], run[run.len() - 1] + 1, &mut found, &mut asked) {
+            if let [block] = run {
+                partial.push(*block);
+            } else {
+                for &block in run {
+                    if !ask_blocks(block, block + 1, &mut found, &mut asked) {
+                        partial.push(block);
+                    }
+                }
+            }
+        }
+        i = k;
+    }
+    let mut j = journal_mut();
+    for &(first, last) in &asked {
+        for block in first..last {
+            j.quiet.entry(block).or_insert(NEVER).asked = frame;
+        }
+    }
+    for &block in &partial {
+        j.quiet.entry(block).or_insert(NEVER).partial = true;
+    }
+    for &(page, _) in &found {
+        j.quiet.entry(page / QUIET_BLOCK).or_insert(NEVER).written = frame;
+    }
+    // A range whose blocks were all asked about this frame is answered by the journal, its blocks
+    // merged into page ranges; any other is asked about on its own, as without the switch.
+    let (mut covered, mut alone) = (Vec::new(), Vec::new());
+    for &(first, last) in &pieces {
+        let blocks = quiet_blocks(first, last);
+        let answered = blocks.clone().all(|block| {
+            j.quiet.get(&block).is_some_and(|q| !q.partial && q.asked == frame)
+        });
+        if answered {
+            covered.push((blocks.start, blocks.end));
+        } else {
+            alone.push((first, last));
+        }
+    }
+    drop(j);
+    covered.sort_unstable();
+    let mut ahead: Vec<(usize, usize)> = Vec::new();
+    for &(first, end) in &covered {
+        match ahead.last_mut() {
+            Some(last) if first * QUIET_BLOCK <= last.1 => last.1 = last.1.max(end * QUIET_BLOCK),
+            _ => ahead.push((first * QUIET_BLOCK, end * QUIET_BLOCK)),
+        }
+    }
+    tally_quiet(2, covered.len() as u64);
+    for (first, last) in alone {
+        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+            && let Some(pages) = kernel_written(first, last)
+        {
+            found.extend(pages);
+            ahead.push((first, last));
+            tally_quiet(3, 1);
+        }
+    }
+    note_hot(&found);
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in found {
+        j.note(page, parts, now);
+    }
+    j.kept = !ahead.is_empty();
+    j.ahead = ahead;
+}
+
+/// The quiet blocks that pages `[first, last)` lie in.
+fn quiet_blocks(first: usize, last: usize) -> std::ops::Range<usize> {
+    first / QUIET_BLOCK..(last - 1) / QUIET_BLOCK + 1
+}
+
+/// Asks the kernel about the quiet blocks `[first, last)` whole: the pages it finds written go to
+/// `found`, the blocks it answered for to `asked`. False if it does not answer for all of them.
+fn ask_blocks(
+    first: usize,
+    last: usize,
+    found: &mut Vec<(usize, u16)>,
+    asked: &mut Vec<(usize, usize)>,
+) -> bool {
+    let Some(pages) = kernel_written(first * QUIET_BLOCK, last * QUIET_BLOCK) else {
+        return false;
+    };
+    found.extend(pages);
+    asked.push((first, last));
+    true
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -696,6 +922,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
+    ASKED_HERE.with(|c| c.set(c.get() + 1));
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
@@ -743,6 +970,50 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
     Some(answer)
+}
+
+thread_local! {
+    /// The askings this thread made of the kernel or the guards in [`writes`]: a texture's check
+    /// ([`writes_for_texture`]) tells by them whether it asked.
+    static ASKED_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Since the last frame-rate line: the texture checks of the write watch ([`writes_for_texture`])
+/// that asked the kernel or the guards (count, microseconds), and those answered without asking.
+static TEXTURE_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`writes`] for a texture's check, counted in [`TEXTURE_CHECKS`].
+pub(crate) fn writes_for_texture(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let before = ASKED_HERE.with(|c| c.get());
+    let began = std::time::Instant::now();
+    let answer = writes(start, end, guarded);
+    let us = began.elapsed().as_micros() as u64;
+    let i = if ASKED_HERE.with(|c| c.get()) != before { 0 } else { 2 };
+    TEXTURE_CHECKS[i].fetch_add(1, Relaxed);
+    TEXTURE_CHECKS[i + 1].fetch_add(us, Relaxed);
+    answer
+}
+
+/// [`TEXTURE_CHECKS`], taken, for the frame line: `frames` frames since the last.
+pub(crate) fn texture_checks_line(frames: f64) -> String {
+    let [asks, asks_us, held, held_us] = [0, 1, 2, 3].map(|i| TEXTURE_CHECKS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    format!(
+        "texture checks of the write watch per frame (VICTORY_ASK_TEXTURES={}): {:.1} asked the kernel or the guards ({:.2} ms), {:.1} answered without asking ({:.2} ms)",
+        u8::from(textures_join()),
+        asks / frames,
+        asks_us / 1e3 / frames,
+        held / frames,
+        held_us / 1e3 / frames,
+    )
+}
+
+/// Whether a submission's one asking takes in the title memory its textures' checks read
+/// (`VICTORY_ASK_TEXTURES=1`; off by default until measured: see [`texture_checks_line`]).
+pub(crate) fn textures_join() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_ASK_TEXTURES").is_some_and(|v| v != "0"));
+    *ON
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
@@ -2862,6 +3133,7 @@ mod parts_tests {
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
+            quiet: BTreeMap::new(),
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
@@ -4113,6 +4385,116 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod batch14_watch_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// `VICTORY_ASK_QUIET`: a 1 MiB block that nothing was found written in
+    /// is asked about once a frame. A later submission of that frame is
+    /// answered from the journal, and the next frame's asking sees the write.
+    #[test]
+    fn quiet_block_is_asked_once_a_frame() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * MIB,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // A quiet block is asked about whole: one that lies inside the allocation.
+        let a = p.next_multiple_of(MIB);
+        let (start, end) = (a, a + MIB);
+        let page = (a + 3 * PAGE + 8) / PAGE;
+        // Frames no other test uses, and nothing written lately (`keep` frames).
+        let (frame, keep) = (7_000_000, 2);
+        let later = |than: u64, pages: &[(usize, u64)]| -> Vec<usize> {
+            pages.iter().filter(|&&(_, w)| w > than).map(|&(p, _)| p).collect()
+        };
+        ask_once_quiet(&[(start, end)], frame, keep);
+        let (first, _) = writes(start, end, false).expect("watched");
+        // SAFETY: a committed page of ours.
+        unsafe { ((a + 3 * PAGE + 8) as *mut u8).write(1) };
+        // The frame's next submission: the journal answers, the block is not asked about again.
+        ask_once_quiet(&[(start, end)], frame, keep);
+        let (_, same_frame) = writes(start, end, false).expect("watched");
+        assert_eq!(later(first, &same_frame), Vec::<usize>::new(), "asked about again in the frame");
+        // The next frame asks about the block: the write is seen.
+        ask_once_quiet(&[(start, end)], frame + 1, keep);
+        let (_, next_frame) = writes(start, end, false).expect("watched");
+        assert_eq!(later(first, &next_frame), [page]);
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_ASK_TEXTURES`: a texture's range near a buffer's is asked about with it, in the
+    /// submission's one asking, so the texture's own check is answered from the journal.
+    #[test]
+    fn a_texture_range_joins_the_submissions_asking() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * MIB,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        // A buffer's range, and a texture's 2 MiB on: within the gap the merged pass joins over.
+        let (buffer, texture) = ((a, a + PAGE), (a + 2 * MIB, a + 2 * MIB + PAGE));
+        // SAFETY: a committed page of ours, in the texture's range.
+        unsafe { ((a + 2 * MIB + 8) as *mut u8).write(1) };
+        ask_once_with(&[buffer], &[texture]);
+        let joined = asked(texture.0, texture.1);
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        let (_, pages) = joined.expect("the texture is not in the submission's asking");
+        assert!(pages.iter().any(|&(page, _)| page == (a + 2 * MIB) / PAGE), "{pages:?}");
+    }
+
+    /// `VICTORY_ASK_TEXTURES`: a texture's range that lies alone is left to its own check, which asks
+    /// about it then.
+    #[test]
+    fn a_lone_texture_range_is_left_to_its_own_asking() {
+        const MIB: usize = 1 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                68 * MIB,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let a = p.next_multiple_of(MIB);
+        // Sixty-four MiB on: beyond the gap the merged pass joins over.
+        let (buffer, texture) = ((a, a + PAGE), (a + 64 * MIB, a + 64 * MIB + PAGE));
+        // SAFETY: a committed page of ours, in the texture's range.
+        unsafe { ((a + 64 * MIB + 8) as *mut u8).write(1) };
+        ask_once_with(&[buffer], &[texture]);
+        let joined = asked(texture.0, texture.1).is_some();
+        ask_once_end();
+        let (_, own) = writes(texture.0, texture.1, false).expect("watched");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        assert!(!joined, "a lone texture range was asked about with the submission");
+        assert!(own.iter().any(|&(page, _)| page == (a + 64 * MIB) / PAGE), "{own:?}");
     }
 }
 
