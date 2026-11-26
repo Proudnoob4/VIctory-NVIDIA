@@ -860,12 +860,18 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     #[cfg(windows)]
     victory_gpu::cores::keep_on_slow_cores("dstorage");
+    #[cfg(windows)]
+    let mut wide = false;
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
+        #[cfg(windows)]
+        if let Some(now) = victory_gpu::cores::disk_cores_for_backlog(lanes.waiting(), wide) {
+            wide = now;
+        }
         drop(lanes);
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
@@ -919,6 +925,11 @@ impl Lanes {
             self.bcpack = Default::default();
             self.since = None;
         }
+    }
+
+    /// Reads submitted and not started, over all queues.
+    fn waiting(&self) -> usize {
+        self.lanes.values().map(|l| l.reads.len()).sum()
     }
 
     /// Starts the next read of the class with the least virtual time, from

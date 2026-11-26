@@ -129,13 +129,7 @@ pub fn keep_on_fast_cores(what: &str) {
 /// 12th-14th gen), leaving fast P-cores free for frame submission and title work.
 pub fn keep_on_slow_cores(what: &str) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ON.get_or_init(|| {
-        std::env::var("VICTORY_DISK_CORES")
-            .ok()
-            .is_some_and(|v| v.trim().eq_ignore_ascii_case("slow"))
-    });
-    if !enabled {
+    if disk_cores() == DiskCores::Any {
         return;
     }
     static SLOW: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
@@ -149,8 +143,54 @@ pub fn keep_on_slow_cores(what: &str) {
     // SAFETY: current thread handle and valid system CPU set IDs.
     let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) };
     if ok != 0 {
-        tracing::info!(what, slow = slow.len(), of, "background worker kept on efficiency cores (VICTORY_DISK_CORES=slow)");
+        tracing::info!(what, slow = slow.len(), of, mode = ?disk_cores(), "background worker kept on efficiency cores (VICTORY_DISK_CORES)");
     }
+}
+
+/// `VICTORY_DISK_CORES`: `slow` keeps the storage workers on the efficiency
+/// cores; `adaptive` does too, except while a burst of reads waits for them
+/// ([`disk_cores_for_backlog`]); anything else (unset): any core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskCores {
+    Any,
+    Slow,
+    Adaptive,
+}
+
+pub fn disk_cores() -> DiskCores {
+    static MODE: std::sync::OnceLock<DiskCores> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DISK_CORES").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "slow" => DiskCores::Slow,
+        "adaptive" => DiskCores::Adaptive,
+        _ => DiskCores::Any,
+    })
+}
+
+/// For `VICTORY_DISK_CORES=adaptive`: the title's loading comes in bursts of
+/// hundreds of reads that queued behind the workers on the efficiency cores
+/// (median wait 30-216 ms, p90 up to 2.7 s at world entry on an i5-13600K,
+/// while each read took 1-6 ms). A worker that starts a read while more than
+/// `VICTORY_DISK_BACKLOG` (default 64) wait runs on any core until fewer than
+/// a quarter of that wait. `wide`: where the calling worker runs now; returns
+/// the new state when it changed (the thread's selection is set then).
+pub fn disk_cores_for_backlog(waiting: usize, wide: bool) -> Option<bool> {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    if disk_cores() != DiskCores::Adaptive {
+        return None;
+    }
+    static BACKLOG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let high = *BACKLOG.get_or_init(|| {
+        std::env::var("VICTORY_DISK_BACKLOG").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(64)
+    });
+    let want = if wide { waiting >= high / 4 } else { waiting > high };
+    if want == wide {
+        return None;
+    }
+    let slow: Vec<u32> = if want { Vec::new() } else { slow_of(&cpu_sets()) };
+    let at = if slow.is_empty() { std::ptr::null() } else { slow.as_ptr() };
+    // SAFETY: the current thread; no ids (any core) or the system's own ids.
+    unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), at, slow.len() as u32) };
+    Some(want)
 }
 
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or
