@@ -102,6 +102,7 @@ pub extern "system" fn XMemVirtualAlloc(
         },
     };
     let asked = protect;
+    let asked_kind = kind;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -169,6 +170,10 @@ pub extern "system" fn XMemVirtualAlloc(
         }
     }
     if base.is_null() {
+        #[cfg(windows)]
+        if !at.is_null() {
+            victory_gpu::title_memory_reserved(at as usize, size, asked_kind, flags, asked);
+        }
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),
