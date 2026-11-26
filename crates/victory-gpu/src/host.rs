@@ -5670,6 +5670,14 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        thread_local! {
+            static SUBMIT_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        SUBMIT_PINNED.with(|p| {
+            if !p.replace(true) {
+                crate::cores::keep_on_fast_cores("victory-submit");
+            }
+        });
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]

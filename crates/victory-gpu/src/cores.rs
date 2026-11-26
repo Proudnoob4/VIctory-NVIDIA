@@ -38,6 +38,13 @@ fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
     if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
+/// The sets of slower classes (e.g. Intel E-cores), if there are faster ones too.
+fn slow_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
+    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+    let slow: Vec<u32> = sets.iter().filter(|c| c.1 < best).map(|c| c.0).collect();
+    if slow.len() == sets.len() { Vec::new() } else { slow }
+}
+
 /// The sets of one fast core of the last, and all the others, for
 /// [`lane_core`]; `None` with fewer than six fast cores.
 fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
@@ -113,8 +120,37 @@ fn stage() -> u32 {
 /// thread was found on a slow one in 1,529 looks of 24,021. (A selection of
 /// processors is a preference the scheduler keeps unless nothing of it is
 /// free.) The title's threads are not asked for.
-pub(crate) fn keep_on_fast_cores(what: &str) {
+pub fn keep_on_fast_cores(what: &str) {
     ask(what, 1);
+}
+
+/// Keeps background disk / decompression workers on slower efficiency cores
+/// when `VICTORY_DISK_CORES=slow` is set (hybrid P/E-core CPUs, e.g. Intel
+/// 12th-14th gen), leaving fast P-cores free for frame submission and title work.
+pub fn keep_on_slow_cores(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ON.get_or_init(|| {
+        std::env::var("VICTORY_DISK_CORES")
+            .ok()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("slow"))
+    });
+    if !enabled {
+        return;
+    }
+    static SLOW: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
+    let (slow, of) = SLOW.get_or_init(|| {
+        let sets = cpu_sets();
+        (slow_of(&sets), sets.len())
+    });
+    if slow.is_empty() {
+        return;
+    }
+    // SAFETY: current thread handle and valid system CPU set IDs.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) };
+    if ok != 0 {
+        tracing::info!(what, slow = slow.len(), of, "background worker kept on efficiency cores (VICTORY_DISK_CORES=slow)");
+    }
 }
 
 /// [`keep_on_fast_cores`] for one of the threads a submission's preparing or

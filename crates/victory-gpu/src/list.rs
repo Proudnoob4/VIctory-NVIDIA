@@ -2184,12 +2184,30 @@ fn skip_sync() -> bool {
 /// layout transitions (which our host list already tracks explicitly) and
 /// `SYNC_NONE` / `NO_ACCESS` barriers do not require flushing every shader SM.
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UavNeed {
+    /// No UAV/write ordering needed (e.g. pure RTV->SRV or read-only barrier).
+    None,
+    /// Only write-before / read-after ordering needed (`ab` writes, `aa` is not UAV,
+    /// neither is `COMMON`): skipped if no `stores`-capable shader or copy ran since
+    /// the last UAV barrier.
+    RawOnly,
+    /// Full UAV ordering needed (`aa` writes UAV, `COMMON`, or unknown group).
+    Full,
+}
+
+#[cfg(windows)]
 pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
+    groups_uav_kind(count, groups) != UavNeed::None
+}
+
+#[cfg(windows)]
+pub(crate) fn groups_uav_kind(count: u32, groups: *const u8) -> UavNeed {
     if count == 0 {
-        return false;
+        return UavNeed::None;
     }
     if !smart_barriers() || groups.is_null() {
-        return true;
+        return UavNeed::Full;
     }
     const TYPE_GLOBAL: u32 = 0;
     const TYPE_TEXTURE: u32 = 1;
@@ -2208,19 +2226,26 @@ pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
         ptr: *const u8,
     }
 
-    let check_words = |p: *const u8, tex_only: bool| -> bool {
+    let check_words = |p: *const u8, tex_only: bool| -> UavNeed {
         // SAFETY: caller verified non-null barrier array entry.
         let (sb, sa, ab, aa) = unsafe {
             let w = p.cast::<u32>();
             (w.read_unaligned(), w.add(1).read_unaligned(), w.add(2).read_unaligned(), w.add(3).read_unaligned())
         };
         if sb == SYNC_NONE || sa == SYNC_NONE || ab == ACCESS_NO_ACCESS || aa == ACCESS_NO_ACCESS {
-            return false;
+            return UavNeed::None;
         }
-        if tex_only {
-            ab == ACCESS_COMMON || aa == ACCESS_COMMON || (ab & ACCESS_UAV) != 0 || (aa & ACCESS_UAV) != 0
-        } else {
-            ab == ACCESS_COMMON || aa == ACCESS_COMMON || (ab & WRITE_ACCESS) != 0 || (aa & ACCESS_UAV) != 0
+        if ab == ACCESS_COMMON || aa == ACCESS_COMMON || (aa & ACCESS_UAV) != 0 {
+            return UavNeed::Full;
+        }
+        let writes_before = if tex_only { (ab & ACCESS_UAV) != 0 } else { (ab & WRITE_ACCESS) != 0 };
+        if writes_before { UavNeed::RawOnly } else { UavNeed::None }
+    };
+
+    let mut need = UavNeed::None;
+    let merge = |cur: &mut UavNeed, next: UavNeed| {
+        if next == UavNeed::Full || (*cur == UavNeed::None && next == UavNeed::RawOnly) {
+            *cur = next;
         }
     };
 
@@ -2231,22 +2256,24 @@ pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
             continue;
         }
         if g.ptr.is_null() {
-            return true;
+            return UavNeed::Full;
         }
         match g.kind {
             TYPE_GLOBAL => {
                 for j in 0..g.num as usize {
                     // SAFETY: `D3D12_GLOBAL_BARRIER` is 16 bytes.
-                    if check_words(unsafe { g.ptr.add(j * 16) }, false) {
-                        return true;
+                    merge(&mut need, check_words(unsafe { g.ptr.add(j * 16) }, false));
+                    if need == UavNeed::Full {
+                        return UavNeed::Full;
                     }
                 }
             }
             TYPE_BUFFER => {
                 for j in 0..g.num as usize {
                     // SAFETY: `D3D12_BUFFER_BARRIER` is 40 bytes (list.rs:2338).
-                    if check_words(unsafe { g.ptr.add(j * 40) }, false) {
-                        return true;
+                    merge(&mut need, check_words(unsafe { g.ptr.add(j * 40) }, false));
+                    if need == UavNeed::Full {
+                        return UavNeed::Full;
                     }
                 }
             }
@@ -2273,18 +2300,19 @@ pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
                         };
                         if res_ptr == 0 || (res_ptr & 7) != 0 || flags > 3 {
                             BARRIER_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return true;
+                            return UavNeed::Full;
                         }
                     }
-                    if check_words(elem, true) {
-                        return true;
+                    merge(&mut need, check_words(elem, true));
+                    if need == UavNeed::Full {
+                        return UavNeed::Full;
                     }
                 }
             }
-            _ => return true,
+            _ => return UavNeed::Full,
         }
     }
-    false
+    need
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -2295,8 +2323,8 @@ pub(crate) fn groups_need_uav(count: u32, groups: *const u8) -> bool {
 extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     #[cfg(windows)]
     {
-        let needs = groups_need_uav(count, groups);
-        barrier_groups_checked(this, count, needs);
+        let need = groups_uav_kind(count, groups);
+        barrier_groups_uav(this, count, need);
     }
     #[cfg(not(windows))]
     let _ = (this, count, groups);
@@ -2304,10 +2332,15 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
 
 #[cfg(windows)]
 pub(crate) fn barrier_groups_checked(this: This, count: u32, needs_uav: bool) {
+    barrier_groups_uav(this, count, if needs_uav { UavNeed::Full } else { UavNeed::None });
+}
+
+#[cfg(windows)]
+pub(crate) fn barrier_groups_uav(this: This, count: u32, need: UavNeed) {
     if count == 0 {
         return;
     }
-    if !needs_uav {
+    if need == UavNeed::None {
         BARRIER_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
@@ -2322,7 +2355,13 @@ pub(crate) fn barrier_groups_checked(this: This, count: u32, needs_uav: bool) {
     if let Some(list) = host_list(this) {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         let mut emit = true;
-        with_state(this, |_, state| { emit = state.take_uav_barrier(); });
+        with_state(this, |_, state| {
+            emit = match need {
+                UavNeed::RawOnly => state.take_uav_barrier_raw(),
+                UavNeed::Full => state.take_uav_barrier(),
+                UavNeed::None => false,
+            };
+        });
         if !emit {
             BARRIER_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
@@ -2642,7 +2681,7 @@ mod tests {
         let g1 = [Group { kind: 1, num: 1, ptr: tex_rtv_to_srv.as_ptr().cast() }];
         assert!(!groups_need_uav(1, g1.as_ptr().cast()));
 
-        // Texture barrier with UAV access before: needs UAV barrier.
+        // Texture barrier with UAV access before (SRV after): RAW-only UAV need.
         let tex_uav: [u32; 16] = [
             128,  // SYNC_COMPUTE_SHADING
             16,   // SYNC_PIXEL_SHADING
@@ -2652,6 +2691,18 @@ mod tests {
         ];
         let g2 = [Group { kind: 1, num: 1, ptr: tex_uav.as_ptr().cast() }];
         assert!(groups_need_uav(1, g2.as_ptr().cast()));
+        assert_eq!(groups_uav_kind(1, g2.as_ptr().cast()), UavNeed::RawOnly);
+
+        // Texture barrier targeting UAV after (WAR): Full UAV need.
+        let tex_to_uav: [u32; 16] = [
+            16,   // SYNC_PIXEL_SHADING
+            128,  // SYNC_COMPUTE_SHADING
+            128,  // ACCESS_SHADER_RESOURCE
+            0x10, // ACCESS_UNORDERED_ACCESS
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let g_war = [Group { kind: 1, num: 1, ptr: tex_to_uav.as_ptr().cast() }];
+        assert_eq!(groups_uav_kind(1, g_war.as_ptr().cast()), UavNeed::Full);
 
         // Read-only buffer barrier (SRV -> VERTEX_BUFFER): no UAV needed.
         let buf_ro: [u32; 10] = [128, 8, 128, 1, 0, 0, 0, 0, 0, 0];

@@ -96,6 +96,10 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Non-zero when a `< 1 MiB` write-combining title buffer lives directly in
+    /// ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` memory ([`buffer_mapped_for`]), holding
+    /// the allocated size in bytes for accounting on drop.
+    mapped_buffer_size: u64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -324,7 +328,8 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
-        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+        + BUFFER_MAPPED_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
 }
@@ -492,6 +497,63 @@ fn window_mapped_most() -> u64 {
 
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Cap on `< 1 MiB` write-combining title buffers placed directly in ReBAR
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` memory (`VICTORY_SMALL_BUFFERS_BAR_MB`, default 0).
+/// Unlike `VICTORY_CARD_BUFFERS_MIN_KB=64` (two-sided staging+DEFAULT with async
+/// copy-up/hash-compare), a single `GPU_UPLOAD` buffer has zero copy-up race while
+/// keeping GPU reads and `InterlockedAdd` atomics in local VRAM/L2 instead of PCIe.
+fn small_buffer_mapped_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SMALL_BUFFERS_BAR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            << 20
+    })
+}
+
+/// Bytes alive and count of small WC title buffers placed in `GPU_UPLOAD`.
+static BUFFER_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+static BUFFER_MAPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Allocates a `< 1 MiB` write-combining title buffer directly in ReBAR
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` when `VICTORY_SMALL_BUFFERS_BAR_MB > 0`,
+/// `VICTORY_SKIP_WC_BACK=1`, and >=15% of the VRAM budget remains free.
+fn buffer_mapped_for(start: u64, end: u64, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let most = small_buffer_mapped_most();
+    if most == 0 || !crate::census::skip_wc_back() {
+        return None;
+    }
+    if !crate::census::all_wc(&[(start as usize, end as usize)]) {
+        return None;
+    }
+    let host = host()?;
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 100 * 85
+    {
+        return None;
+    }
+    if BUFFER_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+        BUFFER_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let made = host.mapped_card_buffer(size, true);
+    if made.is_none() {
+        BUFFER_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        let n = BUFFER_MAPPED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                count = n,
+                mib = BUFFER_MAPPED_BYTES.load(Ordering::Relaxed) >> 20,
+                "VICTORY_SMALL_BUFFERS_BAR_MB: small WC title buffers placed in ReBAR GPU_UPLOAD"
+            );
+        }
+    }
+    made
+}
 
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
@@ -2747,6 +2809,9 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        if self.mapped_buffer_size > 0 {
+            BUFFER_MAPPED_BYTES.fetch_sub(self.mapped_buffer_size, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -3245,6 +3310,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            mapped_buffer_size: 0,
             place: None,
         }
     }
@@ -3288,7 +3354,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        if self.place.is_some() || self.mapped_buffer_size > 0 {
             return;
         }
         let range = (address, address + len);
@@ -3406,7 +3472,7 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
-        if self.place.is_some() {
+        if self.place.is_some() || self.mapped_buffer_size > 0 {
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -5285,6 +5351,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
+        if !big && let Some((buffer, data)) = buffer_mapped_for(key.0, entry.end, size) {
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} mapped on the card", key.0));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.mapped_buffer_size = size;
+            entry.shadow = Some(Arc::new(shadow));
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;

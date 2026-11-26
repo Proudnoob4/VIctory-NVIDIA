@@ -32,7 +32,7 @@ mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
-mod cores;
+pub mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
