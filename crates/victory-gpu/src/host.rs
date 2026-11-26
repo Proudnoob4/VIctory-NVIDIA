@@ -4424,8 +4424,9 @@ impl Host {
         let declared: Vec<Declared> = declared.iter().filter(|(shadow, _)| shadow.carded()).cloned().collect();
         let mut declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         if crate::census::skip_wc_compare() {
+            let min_bytes = crate::census::skip_wc_min_bytes();
             let before = declared.len();
-            declared.retain(|(_, ranges)| !crate::census::all_wc(ranges));
+            declared.retain(|(shadow, ranges)| shadow.span().1 < min_bytes || !crate::census::all_wc(ranges));
             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
         }
         // (Of a copy with a declared range here, that says it.)
@@ -4842,7 +4843,7 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
-                            && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                            && !crate::census::skip_back(r.shadow.span().1, r.declared, (hi - lo) as u64)
                             && !seen.contains(&(copy, lo, hi))
                         {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
@@ -5222,7 +5223,7 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi
-                    && !crate::census::skip_back(r.declared, (hi - lo) as u64)
+                    && !crate::census::skip_back(r.shadow.span().1, r.declared, (hi - lo) as u64)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
                     pieces.push((i, lo, hi, total));
