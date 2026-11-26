@@ -49,6 +49,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod port_journal;
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;
@@ -119,6 +121,6 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_secti
 #[cfg(windows)]
 pub use watch::{
     KernelWrite, kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    title_memory_remapping, title_memory_remapping_in, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

@@ -3838,6 +3838,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::port_journal::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -5750,7 +5751,12 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        // Renderer port #7: the round asked for when the title submitted it.
+        let heaps_on = crate::port_journal::on();
+        let heaps_synced = match crate::port_journal::needed() {
+            0 => crate::descriptor::begin_sync_heaps(),
+            mark => crate::descriptor::begin_sync_heaps_after(mark),
+        };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -5931,14 +5937,29 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        // A title list can leave a buffer promoted to COPY_DEST. Buffers
-        // decay to COMMON between ExecuteCommandLists calls, so submit
-        // the compare separately before signalling this submission's fence.
-        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
+        // A title list can leave a buffer promoted to COPY_DEST. Under D3D12
+        // debug validation (error 538, trustno1-coder/VIctory-NVIDIA#1) or
+        // `VICTORY_SPLIT_COMPARE_SUBMIT=1`, submit the compare separately so
+        // buffers decay to COMMON between ExecuteCommandLists calls. In release
+        // gaming keep it in the same call to avoid +16 extra WDDM submits/frame.
+        let check = if let Some(list) = card.as_ref().and_then(|c| c.check.clone()) {
+            if split_compare_submit() {
+                Some([Some(list)])
+            } else {
+                #[cfg(feature = "diagnostics")]
+                marks.push((lists.len(), crate::copystat::Timed::Compare));
+                lists.push(Some(list));
+                None
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
+        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -7625,6 +7646,10 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written_at(dst, len);
+                    // Renderer port #7: into a heap's records, earlier rounds did not see it.
+                    if crate::descriptor::in_shader_heap(dst, len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7651,6 +7676,9 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
+                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
+                        crate::port_journal::prep_wrote();
+                    }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
@@ -7676,6 +7704,7 @@ impl HostList {
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        crate::port_journal::prep_wrote();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -7978,6 +8007,19 @@ struct Batch {
 fn ahead_of_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_none_or(|v| v != "0") && wide_refresh() && crate::watch::light())
+}
+
+/// Whether a submission's card-compare list runs in its own ExecuteCommandLists
+/// call (trustno1-coder/VIctory-NVIDIA#1, D3D12 error 538). On release WDDM 2.7
+/// splitting every submission adds +16 kernel submits/frame and ~2.5 ms latency,
+/// so default ON only with `VICTORY_D3D12_DEBUG=1` or opt-in
+/// `VICTORY_SPLIT_COMPARE_SUBMIT=1`.
+fn split_compare_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::switch::on("VICTORY_SPLIT_COMPARE_SUBMIT")
+            || (cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG"))
+    })
 }
 
 /// (`VICTORY_REFRESH_ONCE=1`, default off) A copy's range brought up to date in

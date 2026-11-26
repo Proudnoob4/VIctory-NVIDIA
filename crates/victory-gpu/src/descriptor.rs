@@ -268,6 +268,74 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     SyncedHeaps(Some(mine))
 }
 
+/// Renderer port #7 (`crate::port_journal`): [`begin_sync_heaps`] for a
+/// submission that needs round `mark` (asked for if it has not been). 0: as
+/// [`begin_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// Renderer port #7: the number of a round of the heaps' records that begins
+/// after this call, asked for if none is waiting to begin.
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// Renderer port #7: the number of the first round that begins after this
+/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
+}
+
 #[cfg(windows)]
 impl Drop for SyncedHeaps {
     fn drop(&mut self) {
@@ -741,15 +809,16 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap is still there, and `id` says it is the one that
+/// took them ([crate::descriptor::host::HostHeap::id], fxceless#1324).
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -1816,7 +1885,7 @@ mod tests {
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1);
+        host_heap.release(host_heap.id(), next, 1);
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(

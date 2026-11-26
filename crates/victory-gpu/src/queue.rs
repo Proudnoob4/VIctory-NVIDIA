@@ -244,6 +244,9 @@ fn submit_split(this: This, lists: &[This]) {
             .flat_map(|&l| crate::list::host_runs(l))
             .collect();
         host.execute(&now);
+        // They have run: their descriptor tables' slots are free again, as
+        // in `submit_cut` (fxceless#1320).
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);

@@ -54,19 +54,31 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
-impl Journal {
+impl Shard {
+    const fn new() -> Shard {
+        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+    }
+
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
+    ///
+    /// A page's notes only go up: noted under the shared lock (renderer port #7),
+    /// another asking with a higher number may have noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.insert(page, now).unwrap_or(0);
+        let before = self.written.get(&page).copied().unwrap_or(0);
+        self.written.insert(page, before.max(now));
         if parts == WHOLE || !parts_on() {
-            self.parts.remove(&page);
+            if now >= before {
+                self.parts.remove(&page);
+            } else if let Some(all) = self.parts.get_mut(&page) {
+                all.iter_mut().for_each(|at| *at = (*at).max(now));
+            }
             return before;
         }
         let all = self.parts.entry(page).or_insert([before; PARTS]);
         for (k, at) in all.iter_mut().enumerate() {
             if parts >> k & 1 != 0 {
-                *at = now;
+                *at = (*at).max(now);
             }
         }
         before
@@ -81,12 +93,175 @@ impl Journal {
     }
 }
 
+/// The pages of a part of the journal ([`Notes`]): pieces of
+/// `1 << SHARD_SHIFT` pages (64 MiB), every [`SHARDS`]th piece in one part.
+const SHARD_SHIFT: u32 = 10;
+const SHARDS: usize = 64;
+
+fn shard_of(page: usize) -> usize {
+    (page >> SHARD_SHIFT) % SHARDS
+}
+
+fn shards_of(first: usize, last: usize) -> u64 {
+    if first >= last {
+        return 0;
+    }
+    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+    if b - a + 1 >= SHARDS {
+        return u64::MAX;
+    }
+    (a..=b).fold(0, |m, piece| m | 1 << (piece % SHARDS))
+}
+
+fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
+    pages.into_iter().fold(0, |m, page| m | 1 << shard_of(page))
+}
+
+struct Notes([RwLock<Shard>; SHARDS]);
+
+struct Shard {
+    written: BTreeMap<usize, u64>,
+    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+}
+
+impl Notes {
+    const fn new() -> Notes {
+        Notes([const { RwLock::new(Shard::new()) }; SHARDS])
+    }
+
+    fn shard_mut(&mut self, page: usize) -> &mut Shard {
+        self.0[shard_of(page)].get_mut().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read(&self, shard: usize) -> std::sync::RwLockReadGuard<'_, Shard> {
+        if let Ok(s) = self.0[shard].try_read() {
+            return s;
+        }
+        let began = std::time::Instant::now();
+        let s = self.0[shard].read().unwrap_or_else(|e| e.into_inner());
+        port7_waited(P7_PART_WAITS, began);
+        s
+    }
+
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        self.shard_mut(page).note(page, parts, now)
+    }
+
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        self.read(shard_of(page)).parts_since(page, taken)
+    }
+
+    fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        match pieces(first, last) {
+            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.written.range(from..to).all(|(&p, &w)| each(p, w))
+            }),
+            None => {
+                let mut all: Vec<(usize, u64)> = Vec::new();
+                for shard in 0..SHARDS {
+                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+                }
+                all.sort_unstable();
+                all.into_iter().all(|(p, w)| each(p, w))
+            }
+        }
+    }
+
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        let mut out = Vec::new();
+        self.each(first, last, |p, w| {
+            out.push((p, w));
+            true
+        });
+        out
+    }
+
+    fn hold(&self, shards: u64, write: bool) -> Held<'_> {
+        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
+        let mut m = shards;
+        while m != 0 {
+            let shard = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let lock = &self.0[shard];
+            if write {
+                let guard = match lock.try_write() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        let began = std::time::Instant::now();
+                        let g = lock.write().unwrap_or_else(|e| e.into_inner());
+                        port7_waited(P7_PART_WAITS, began);
+                        g
+                    }
+                };
+                held.write.push(guard);
+            } else {
+                held.read.push(self.read(shard));
+            }
+        }
+        held
+    }
+}
+
+fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
+    if first >= last {
+        return Some(Vec::new());
+    }
+    let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+    if b - a >= 4 * SHARDS {
+        return None;
+    }
+    Some((a..=b).map(|piece| (first.max(piece << SHARD_SHIFT), last.min((piece + 1) << SHARD_SHIFT))).collect())
+}
+
+struct Held<'a> {
+    shards: u64,
+    read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
+    write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
+}
+
+impl Held<'_> {
+    fn place(&self, page: usize) -> usize {
+        let shard = shard_of(page);
+        assert!(self.shards >> shard & 1 != 0, "page {page:#x}: its part is not held");
+        (self.shards & ((1u64 << shard) - 1)).count_ones() as usize
+    }
+
+    fn shard(&self, page: usize) -> &Shard {
+        let at = self.place(page);
+        if self.write.is_empty() { &self.read[at] } else { &self.write[at] }
+    }
+
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let at = self.place(page);
+        self.write[at].note(page, parts, now)
+    }
+
+    fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
+        match pieces(first, last) {
+            Some(pieces) => pieces
+                .into_iter()
+                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
+                .collect(),
+            None => {
+                let mut all: Vec<(usize, u64)> = if self.write.is_empty() {
+                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect()
+                } else {
+                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect()
+                };
+                all.sort_unstable();
+                all
+            }
+        }
+    }
+}
+
 /// Of the pages of a copy that were written after it took them (page number,
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     let j = journal();
-    pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
+    pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
 }
 
 /// Numbers the askings; 0 is "never". Counted up with the journal held
@@ -119,12 +294,8 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 }
 
 struct Journal {
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
-    /// the parts are known ([`parts_on`]); a page that is not here was
-    /// written whole, as far as anyone knows.
-    parts: std::collections::HashMap<usize, [u64; PARTS], std::hash::BuildHasherDefault<PageHash>>,
+    /// Per page, the asking that last found it written, and its parts' ([`Shard`]).
+    notes: Notes,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
@@ -145,8 +316,7 @@ struct Journal {
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
-    written: BTreeMap::new(),
-    parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    notes: Notes::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
@@ -157,14 +327,107 @@ fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
     if let Ok(j) = JOURNAL.try_read() {
         return j;
     }
-    waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()))
+    let began = std::time::Instant::now();
+    let j = waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()));
+    port7_waited(P7_READ_WAITS, began);
+    j
 }
 
 fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
+    port7_count(P7_ALONE, 1);
     if let Ok(j) = JOURNAL.try_write() {
         return j;
     }
-    waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
+    let began = std::time::Instant::now();
+    let j = waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()));
+    port7_waited(P7_ALONE_WAITS, began);
+    j
+}
+
+/// Renderer port #7 (`VICTORY_PORT_JOURNAL=1`, off by default; credit `@avatarmanz`).
+pub(crate) fn port_journal() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_JOURNAL") {
+        return on;
+    }
+    #[cfg(test)]
+    if PORT_JOURNAL_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PORT_JOURNAL_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    static ON_LANE: bool = std::thread::current().name() == Some("victory-submit");
+}
+
+static PORT7: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+const P7_ALONE: usize = 0;
+const P7_ALONE_WAITS: usize = 1;
+const P7_READ_WAITS: usize = 3;
+const P7_LANE_WAITS: usize = 5;
+const P7_SKIPPED: usize = 7;
+const P7_SHARED_NOTES: usize = 8;
+const P7_PART_WAITS: usize = 9;
+
+fn port7_count(what: usize, n: u64) {
+    PORT7[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn port7_waited(what: usize, began: std::time::Instant) {
+    let ns = began.elapsed().as_nanos() as u64;
+    port7_count(what, 1);
+    port7_count(what + 1, ns);
+    if what != P7_PART_WAITS && ON_LANE.with(|l| *l) {
+        port7_count(P7_LANE_WAITS, 1);
+        port7_count(P7_LANE_WAITS + 1, ns);
+    }
+}
+
+pub(crate) struct Port7Counts([u64; 12]);
+
+pub(crate) fn port_journal_counts() -> Port7Counts {
+    Port7Counts(std::array::from_fn(|i| PORT7[i].swap(0, std::sync::atomic::Ordering::Relaxed)))
+}
+
+impl Port7Counts {
+    pub(crate) fn per_frame(&self, frames: f64) -> String {
+        let n = |i: usize| self.0[i] as f64 / frames;
+        let ms = |i: usize| self.0[i] as f64 / 1e6 / frames;
+        format!(
+            "the lane waited for its lock {:.1} times, {:.2} ms; all threads waited to take it alone {:.1} times ({:.2} ms) of {:.1} \
+             takings alone, shared {:.1} times ({:.2} ms); {:.1} takings alone found needless, {:.1} notings done shared, {:.1} waits \
+             for a part ({:.2} ms)",
+            n(P7_LANE_WAITS),
+            ms(P7_LANE_WAITS + 1),
+            n(P7_ALONE_WAITS),
+            ms(P7_ALONE_WAITS + 1),
+            n(P7_ALONE),
+            n(P7_READ_WAITS),
+            ms(P7_READ_WAITS + 1),
+            n(P7_SKIPPED),
+            n(P7_SHARED_NOTES),
+            n(P7_PART_WAITS),
+            ms(P7_PART_WAITS + 1),
+        )
+    }
+}
+
+fn note_shared(written: &[(usize, u16)]) -> u64 {
+    let j = journal();
+    let mut held = j.notes.hold(shards_of_pages(written.iter().map(|w| w.0)), true);
+    let now = next_asking();
+    for &(page, parts) in written {
+        held.note(page, parts, now);
+    }
+    port7_count(P7_SHARED_NOTES, 1);
+    now
 }
 
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
@@ -357,12 +620,19 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         i = k;
     }
     note_hot(&written);
+    if port_journal() {
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.ahead = asked;
+        return;
+    }
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
     let now = j.ahead_asked;
     for (page, parts) in written {
-        j.note(page, parts, now);
+        j.notes.note(page, parts, now);
     }
 }
 
@@ -504,6 +774,13 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if port_journal() {
+        let j = journal();
+        if j.kept || j.ahead.is_empty() {
+            port7_count(P7_SKIPPED, 1);
+            return;
+        }
+    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
@@ -745,11 +1022,19 @@ fn ask_once_quiet(ranges: &[(usize, usize)], frame: u64, keep: u64) {
         }
     }
     note_hot(&found);
+    if port_journal() {
+        let now = note_shared(&found);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.kept = !ahead.is_empty();
+        j.ahead = ahead;
+        return;
+    }
     let mut j = journal_mut();
     let now = next_asking();
     j.ahead_asked = now;
     for (page, parts) in found {
-        j.note(page, parts, now);
+        j.notes.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
@@ -803,6 +1088,14 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         }
     }
     note_hot(&written);
+    if port_journal() {
+        let now = note_shared(&written);
+        let mut j = journal_mut();
+        j.ahead_asked = now;
+        j.kept = !ahead.is_empty();
+        j.ahead = ahead;
+        return;
+    }
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
     // the two parts another thread may have asked about a range of the
@@ -811,7 +1104,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     let now = next_asking();
     j.ahead_asked = now;
     for (page, parts) in written {
-        j.note(page, parts, now);
+        j.notes.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
@@ -820,6 +1113,10 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    if port_journal() && !journal().kept {
+        port7_count(P7_SKIPPED, 1);
+        return;
+    }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
@@ -831,6 +1128,10 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if port_journal() && (len == 0 || !journal().kept) {
+        port7_count(P7_SKIPPED, 1);
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -841,11 +1142,11 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // until the next asking copy the pages again.
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.note(page, WHOLE, now);
+        j.notes.note(page, WHOLE, now);
     }
     for (_, others) in elsewhere(at, len) {
         for other in others {
-            j.note(other / PAGE, WHOLE, now);
+            j.notes.note(other / PAGE, WHOLE, now);
         }
     }
 }
@@ -890,7 +1191,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -900,9 +1201,18 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| {
+        j.ahead
+            .iter()
+            .any(|&(a, b)| a <= first && last <= b)
+            .then(|| (j.ahead_asked, j.notes.range(first, last)))
+    };
+    let fresh = || {
+        let j = journal();
+        let held = j.notes.hold(shards_of(first, last), false);
+        (next_asking(), held.range(first, last))
+    };
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -913,8 +1223,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             tally(2, 1);
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
-        let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some(fresh());
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
@@ -952,16 +1261,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
-        let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some(fresh());
     }
-    let answer = {
+    let answer = if port_journal() {
+        let j = journal();
+        let mut held = j.notes.hold(shards_of(first, last) | shards_of_pages(pages.iter().map(|p| p.0)), true);
+        let now = next_asking();
+        for &(page, parts) in &pages {
+            held.note(page, parts, now);
+        }
+        port7_count(P7_SHARED_NOTES, 1);
+        (now, held.range(first, last))
+    } else {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
-            j.note(page, parts, now);
+            j.notes.note(page, parts, now);
         }
-        (now, of(&j))
+        (now, j.notes.range(first, last))
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -1038,7 +1355,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         return false;
     };
     (ranged != 0 || all_copied)
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -1293,7 +1610,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     }
     // No mapping changes until all is told: a view of the page that came
     // after the look at them would not be.
-    let Some(_reading) = title_memory_reading_now() else {
+    let Some(_reading) = title_memory_reading_now_in(block * BLOCK, BLOCK) else {
         return Beside::Cannot;
     };
     let Some((page, shown)) = crate::inplace::beside_page(block * BLOCK) else {
@@ -1874,9 +2191,6 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         }
     }
     {
-        let mut j = journal_mut();
-        let now = next_asking();
-        noted = now;
         let mut blocks: Vec<(usize, u16)> = Vec::with_capacity(spans.len());
         for &page in pages {
             let (block, part) = (page / PARTS, 1u16 << (page % PARTS));
@@ -1885,12 +2199,28 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
                 _ => blocks.push((block, part)),
             }
         }
-        for (block, parts) in blocks {
-            before.push((block, j.note(block, parts, now)));
-        }
-        for (_, others) in &elsewhere {
-            for other in others {
-                j.note(other / PAGE, WHOLE, now);
+        let others = || elsewhere.iter().flat_map(|(_, others)| others.iter().map(|other| other / PAGE));
+        if port_journal() {
+            let j = journal();
+            let mut held = j.notes.hold(shards_of_pages(blocks.iter().map(|b| b.0).chain(others())), true);
+            let now = next_asking();
+            noted = now;
+            for (block, parts) in blocks {
+                before.push((block, held.note(block, parts, now)));
+            }
+            for other in others() {
+                held.note(other, WHOLE, now);
+            }
+            port7_count(P7_SHARED_NOTES, 1);
+        } else {
+            let mut j = journal_mut();
+            let now = next_asking();
+            noted = now;
+            for (block, parts) in blocks {
+                before.push((block, j.notes.note(block, parts, now)));
+            }
+            for other in others() {
+                j.notes.note(other, WHOLE, now);
             }
         }
     }
@@ -2353,7 +2683,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// pages without mutating journal state).
 pub(crate) fn was_written_since(page: usize, since: u64) -> bool {
     let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
-    j.written.get(&page).is_some_and(|&w| w > since)
+    j.notes.read(shard_of(page)).written.get(&page).is_some_and(|&w| w > since)
 }
 
 /// Atomically transitions a single-view clean `watch`-guarded block directly
@@ -2402,9 +2732,10 @@ pub(crate) fn before_virtual_free(at: usize, len: usize) {
     let last = at.saturating_add(len).div_ceil(PAGE);
     {
         let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-        let stale: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
-        for p in stale {
-            j.written.remove(&p);
+        for p in first..last {
+            let s = j.notes.shard_mut(p);
+            s.written.remove(&p);
+            s.parts.remove(&p);
         }
     }
     let mut g = guards();
@@ -2660,7 +2991,13 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] Changing);
+
+#[allow(dead_code)]
+enum Changing {
+    Whole(std::sync::RwLockWriteGuard<'static, ()>),
+    Fine(fine::WriteGuard),
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2811,6 +3148,13 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_in(&[(0, usize::MAX)])
+}
+
+/// [`title_memory_remapping`] for a change that touches title memory in
+/// `ranges` (start, end) alone: with `VICTORY_MAP_LOCK_FINE=1` reads in place
+/// of other memory go on meanwhile ([`fine`]; credit `@zocram4cc`, `19dcdafc`).
+pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -2821,31 +3165,193 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let changing = if fine::on() {
+        Changing::Fine(fine::FINE.write(ranges))
+    } else {
+        Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    };
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Read);
+
+#[allow(dead_code)]
+enum Read {
+    Whole(std::sync::RwLockReadGuard<'static, ()>),
+    Fine(fine::ReadGuard),
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_in(0, usize::MAX)
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
+/// [`title_memory_reading`] of `[at, at + len)` alone: with
+/// `VICTORY_MAP_LOCK_FINE=1` only a change of that memory is waited for.
+pub fn title_memory_reading_in(at: usize, len: usize) -> Reading {
+    if fine::on() {
+        let (guard, waited) = fine::FINE.read(at, at.saturating_add(len));
+        if let Some(since) = waited {
+            mapping_waited(at, len, since);
+        }
+        return Reading(Read::Fine(guard));
+    }
+    let guard = match MAPPING.try_read() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let waited = std::time::Instant::now();
+            let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+            mapping_waited(at, len, waited);
+            guard
+        }
+    };
+    Reading(Read::Whole(guard))
+}
+
+#[cfg(feature = "diagnostics")]
+fn mapping_waited(at: usize, len: usize, since: std::time::Instant) {
+    use crate::copystat::{C, add};
+    let us = since.elapsed().as_micros() as u64;
+    let (waits, waited) = if (at, len) == (0, usize::MAX) {
+        (C::ReadWaitsWhole, C::ReadWaitsWholeUs)
+    } else {
+        (C::ReadWaitsRanged, C::ReadWaitsRangedUs)
+    };
+    add(waits, 1);
+    add(waited, us);
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn mapping_waited(_at: usize, _len: usize, _since: std::time::Instant) {}
+
+/// [`title_memory_reading`] if it can be had at once.
 pub fn title_memory_reading_now() -> Option<Reading> {
+    title_memory_reading_now_in(0, usize::MAX)
+}
+
+/// [`title_memory_reading_in`] if it can be had at once.
+pub fn title_memory_reading_now_in(at: usize, len: usize) -> Option<Reading> {
+    if fine::on() {
+        return fine::FINE.try_read(at, at.saturating_add(len)).map(|g| Reading(Read::Fine(g)));
+    }
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading(Read::Whole(guard))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Read::Whole(e.into_inner()))),
         Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// `VICTORY_MAP_LOCK_FINE=1`, default off: the mapping lock by range.
+pub(crate) mod fine {
+    use std::sync::{Condvar, Mutex, MutexGuard};
+    use std::time::Instant;
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("VICTORY_MAP_LOCK_FINE").is_ok_and(|v| v.trim() == "1")
+        });
+        *ON
+    }
+
+    struct State {
+        writer: Option<Vec<(usize, usize)>>,
+        readers: Vec<(usize, usize, u64)>,
+        next: u64,
+    }
+
+    pub(crate) struct Fine {
+        state: Mutex<State>,
+        moved: Condvar,
+        one: Mutex<()>,
+    }
+
+    pub(crate) static FINE: Fine = Fine::new();
+
+    impl Fine {
+        pub(crate) const fn new() -> Fine {
+            Fine {
+                state: Mutex::new(State { writer: None, readers: Vec::new(), next: 1 }),
+                moved: Condvar::new(),
+                one: Mutex::new(()),
+            }
+        }
+
+        fn state(&self) -> MutexGuard<'_, State> {
+            self.state.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        pub(crate) fn read(&'static self, from: usize, to: usize) -> (ReadGuard, Option<Instant>) {
+            let mut s = self.state();
+            let mut waited = None;
+            while s.writer.as_deref().is_some_and(|w| overlaps(w, from, to)) {
+                waited.get_or_insert_with(Instant::now);
+                s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            let ticket = s.next;
+            s.next += 1;
+            s.readers.push((from, to, ticket));
+            (ReadGuard { fine: self, ticket }, waited)
+        }
+
+        pub(crate) fn try_read(&'static self, from: usize, to: usize) -> Option<ReadGuard> {
+            let mut s = self.state();
+            if s.writer.as_deref().is_some_and(|w| overlaps(w, from, to)) {
+                return None;
+            }
+            let ticket = s.next;
+            s.next += 1;
+            s.readers.push((from, to, ticket));
+            Some(ReadGuard { fine: self, ticket })
+        }
+
+        pub(crate) fn write(&'static self, ranges: &[(usize, usize)]) -> WriteGuard {
+            let one = self.one.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = self.state();
+            s.writer = Some(ranges.to_vec());
+            while s.readers.iter().any(|r| overlaps(ranges, r.0, r.1)) {
+                s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(s);
+            WriteGuard { fine: self, _one: one }
+        }
+    }
+
+    fn overlaps(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
+        ranges.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    pub(crate) struct ReadGuard {
+        fine: &'static Fine,
+        ticket: u64,
+    }
+
+    impl Drop for ReadGuard {
+        fn drop(&mut self) {
+            let mut s = self.fine.state();
+            if let Some(i) = s.readers.iter().position(|r| r.2 == self.ticket) {
+                s.readers.swap_remove(i);
+            }
+            if s.writer.is_some() {
+                self.fine.moved.notify_all();
+            }
+        }
+    }
+
+    pub(crate) struct WriteGuard {
+        fine: &'static Fine,
+        _one: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for WriteGuard {
+        fn drop(&mut self) {
+            self.fine.state().writer = None;
+            self.fine.moved.notify_all();
+        }
     }
 }
 
@@ -3127,14 +3633,7 @@ mod parts_tests {
 
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
-        let mut j = Journal {
-            written: BTreeMap::new(),
-            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-            ahead: Vec::new(),
-            ahead_asked: 0,
-            kept: false,
-            quiet: BTreeMap::new(),
-        };
+        let mut j = Shard::new();
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
         // Parts 0 and 5 at 4, part 5 again at 6: at 2 the whole page is due.
@@ -3544,7 +4043,7 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges, false);
-        let last = journal().written.get(&(p / PAGE + 1)).copied();
+        let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
@@ -4951,5 +5450,250 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod fine_tests {
+    use super::fine::Fine;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    const SOON: Duration = Duration::from_secs(5);
+    const LATER: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn a_reader_of_r_goes_on_while_a_writer_changes_a_disjoint_w() {
+        static F: Fine = Fine::new();
+        let writing = F.write(&[(0x1000, 0x2000)]);
+        let (entered, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let (_reading, _) = F.read(0x8000, 0x9000);
+            entered.send(()).unwrap();
+        });
+        let went = went_on.recv_timeout(SOON).is_ok();
+        drop(writing);
+        reader.join().unwrap();
+        assert!(went);
+    }
+
+    #[test]
+    fn a_reader_of_an_overlapping_r_waits_for_the_writer() {
+        static F: Fine = Fine::new();
+        let writing = F.write(&[(0x1000, 0x2000)]);
+        let (entered, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let (_reading, _) = F.read(0x1800, 0x2800);
+            entered.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(writing);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        reader.join().unwrap();
+        assert!(!early);
+        assert!(after);
+    }
+
+    #[test]
+    fn a_writer_is_not_starved_by_a_stream_of_overlapping_readers() {
+        static F: Fine = Fine::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let (_reading, _) = F.read(0x1000, 0x3000);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(LATER);
+        let (done, got) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _writing = F.write(&[(0x2000, 0x2800)]);
+            done.send(()).unwrap();
+        });
+        let got_it = got.recv_timeout(SOON).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        writer.join().unwrap();
+        assert!(got_it);
+    }
+
+    #[test]
+    fn an_unranged_reader_or_writer_excludes_as_the_lock_did() {
+        static F: Fine = Fine::new();
+        let (reading, _) = F.read(0, usize::MAX);
+        let (done, went_on) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _writing = F.write(&[(0x5000, 0x6000)]);
+            done.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(reading);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        writer.join().unwrap();
+        assert!(!early && after);
+
+        let writing = F.write(&[(0, usize::MAX)]);
+        let (done, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let (_reading, _) = F.read(0x5000, 0x6000);
+            done.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(writing);
+        let after = went_on.recv_timeout(SOON).is_ok();
+        reader.join().unwrap();
+        assert!(!early && after);
+    }
+
+    #[test]
+    fn a_change_excludes_a_read_of_other_memory_only_with_the_switch_off() {
+        let fine = super::fine::on();
+        let changing = super::title_memory_remapping_in(&[(0x1000, 0x2000)]);
+        let (entered, went_on) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _reading = super::title_memory_reading_in(0x8000, 0x1000);
+            entered.send(()).unwrap();
+        });
+        let early = went_on.recv_timeout(LATER).is_ok();
+        drop(changing);
+        let after = early || went_on.recv_timeout(SOON).is_ok();
+        reader.join().unwrap();
+        assert_eq!(early, fine);
+        assert!(after);
+    }
+}
+
+#[cfg(test)]
+mod port7_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    fn rng(seed: &mut u64, n: usize) -> usize {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 33) as usize % n.max(1)
+    }
+
+    #[test]
+    fn parts_pieces_and_ranges_agree() {
+        const P: usize = 1 << SHARD_SHIFT;
+        assert_eq!(shards_of(0, 0), 0);
+        assert_eq!(shards_of(0, 1), 1);
+        assert_eq!(shards_of(P - 1, P + 1), 0b11);
+        assert_eq!(shards_of(63 * P, 65 * P), 1 << 63 | 1);
+        assert_eq!(shards_of(5, 5 + SHARDS * P), u64::MAX);
+        assert_eq!(pieces(P - 2, 2 * P + 3), Some(vec![(P - 2, P), (P, 2 * P), (2 * P, 2 * P + 3)]));
+        assert_eq!(pieces(0, 1 << 40), None);
+        let notes = Notes::new();
+        let mut want: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut seed = 7;
+        for n in 1..4000u64 {
+            let page = rng(&mut seed, 70 * P);
+            let mut held = notes.hold(shards_of_pages([page]), true);
+            held.note(page, WHOLE, n);
+            want.insert(page, n);
+        }
+        for _ in 0..500 {
+            let first = rng(&mut seed, 70 * P);
+            let last = first + rng(&mut seed, 3 * P);
+            let expected: Vec<(usize, u64)> = want.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(notes.range(first, last), expected);
+            assert_eq!(notes.hold(shards_of(first, last), false).range(first, last), expected);
+        }
+        assert_eq!(notes.range(0, usize::MAX / 2), want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
+        assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2).len(), want.len());
+    }
+
+    #[test]
+    fn notes_only_go_up() {
+        let mut s = Shard::new();
+        assert_eq!(s.note(3, WHOLE, 9), 0);
+        assert_eq!(s.note(3, 0b11, 5), 9);
+        assert_eq!(s.written[&3], 9);
+        assert_eq!(s.parts_since(3, 8), WHOLE);
+        assert_eq!(s.note(3, 0b100, 12), 9);
+        assert_eq!(s.parts_since(3, 9), 0b100);
+        assert_eq!(s.note(3, WHOLE, 10), 12);
+        assert_eq!(s.parts_since(3, 10), 0b100);
+        assert_eq!(s.parts_since(3, 9), WHOLE);
+        assert_eq!(s.written[&3], 12);
+    }
+
+    #[test]
+    fn a_fresh_number_sees_every_lower_note_and_nobody_deadlocks() {
+        const P: usize = 1 << SHARD_SHIFT;
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 2000;
+        static NOTES: Notes = Notes::new();
+        static NUMBER: AtomicU64 = AtomicU64::new(0);
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            type Read = (usize, usize, u64, Vec<(usize, u64)>);
+            let logs: Vec<(Vec<(usize, u64)>, Vec<Read>)> = std::thread::scope(|s| {
+                let all: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        s.spawn(move || {
+                            let mut seed = t as u64 * 104_729 + 3;
+                            let (mut noted, mut read) = (Vec::new(), Vec::new());
+                            for _ in 0..ROUNDS {
+                                let first = rng(&mut seed, 200 * P);
+                                if rng(&mut seed, 2) == 0 {
+                                    let mut pages: Vec<usize> =
+                                        (0..1 + rng(&mut seed, 6)).map(|_| first + rng(&mut seed, 3 * P)).collect();
+                                    if rng(&mut seed, 4) == 0 {
+                                        pages.push(rng(&mut seed, 200 * P));
+                                    }
+                                    let mut held = NOTES.hold(shards_of_pages(pages.iter().copied()), true);
+                                    let now = NUMBER.fetch_add(1, Relaxed) + 1;
+                                    for &p in &pages {
+                                        held.note(p, WHOLE, now);
+                                        noted.push((p, now));
+                                    }
+                                } else {
+                                    let last = first + 1 + rng(&mut seed, 3 * P);
+                                    let held = NOTES.hold(shards_of(first, last), false);
+                                    let now = NUMBER.fetch_add(1, Relaxed) + 1;
+                                    read.push((first, last, now, held.range(first, last)));
+                                }
+                            }
+                            (noted, read)
+                        })
+                    })
+                    .collect();
+                all.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut by_page: std::collections::HashMap<usize, Vec<u64>> = Default::default();
+            for (noted, _) in &logs {
+                for &(p, n) in noted {
+                    by_page.entry(p).or_default().push(n);
+                }
+            }
+            by_page.values_mut().for_each(|v| v.sort_unstable());
+            let mut checked = 0;
+            for (_, read) in &logs {
+                for (first, last, now, seen) in read {
+                    let seen: std::collections::HashMap<usize, u64> = seen.iter().copied().collect();
+                    for (&p, ns) in by_page.iter().filter(|(p, _)| (*first..*last).contains(*p)) {
+                        let below = ns.partition_point(|n| n < now);
+                        if below > 0 {
+                            let wanted = ns[below - 1];
+                            let got = seen.get(&p).copied().unwrap_or(0);
+                            assert!(got >= wanted);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(checked > 1000);
+            done.send(()).unwrap();
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(60)).expect("deadlock or check failure");
     }
 }

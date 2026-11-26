@@ -356,7 +356,13 @@ impl Pools {
         pool.taken.get(at - shard * self.size).copied()
     }
 }
+/// Each host heap's identity, handed out in order: a range of dynamic slots
+/// is given back to the heap that took it, never to a heap made later at the
+/// same address (fxceless#1324).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1994,6 +2000,7 @@ impl HostHeap {
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -2156,6 +2163,12 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// This heap's identity ([`NEXT_ID`]): dynamic slots are given back only
+    /// to it, never to a heap made later at the same address.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Writes the word of the table of element strides for the dynamic slot
@@ -3032,10 +3045,13 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if they were taken by this heap (`id == self.id`).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -6531,13 +6547,32 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         eprintln!("free after release {}", heap.free.load(std::sync::atomic::Ordering::Relaxed));
         for (i, sh) in heap.pool.shards.iter().enumerate() { let pl = sh.lock().unwrap_or_else(|e| e.into_inner()); eprintln!("shard {i} free {} runs {:?}", pl.free(), pl.at); }
         assert_eq!(heap.dynamic(50), Some(4));
         eprintln!("free after 50 {}", heap.free.load(std::sync::atomic::Ordering::Relaxed));
         for (i, sh) in heap.pool.shards.iter().enumerate() { let pl = sh.lock().unwrap_or_else(|e| e.into_inner()); eprintln!("shard {i} free {} runs {:?}", pl.free(), pl.at); }
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(a) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let free = a.free.load(Relaxed);
+        a.release(b.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free, "another heap's identity gave the range back");
+        a.release(a.id(), first, 2);
+        assert_eq!(a.free.load(Relaxed), free + 2, "their own heap did not get the range back");
     }
 
     /// The cursor moves on: a shard with no run that fits is passed over
