@@ -3363,6 +3363,12 @@ pub(crate) fn settle_for_present() {
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
+/// [`settle_now`] when the dynamic descriptor slots ran out: the flights'
+/// lists give theirs back as they land. Counted with the settles for too
+/// much in the air, which it is.
+pub(crate) fn settle_for_tables() {
+    settle_now(WHY_MOST);
+}
 
 /// [`land`] at the end of a submission, on a thread of its own with
 /// `VICTORY_LAND_ASIDE=1` (off by default): moves host command-list allocator
@@ -8912,6 +8918,7 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    logged_frames: u64,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
@@ -8926,6 +8933,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            logged_frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
@@ -8947,6 +8955,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.logged_frames += 1;
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -9055,6 +9064,7 @@ impl Meter {
         // once every 5 s) are made by a thread of ours ([`meter_lines`]).
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let logged_frames = std::mem::take(&mut self.logged_frames).max(1) as f64;
             #[cfg(feature = "diagnostics")]
             let copy_stats_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
             meter_lines(move || {
@@ -9150,11 +9160,20 @@ impl Meter {
                     );
                 }
                 {
-                    let bs = [0, 1, 2, 3, 4, 5].map(|i| crate::list::BARRIER_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                    let bs = [0, 1, 2, 3, 4, 5].map(|i| crate::list::BARRIER_STATS[i].swap(0, Ordering::Relaxed) as f64 / logged_frames);
                     tracing::info!(
                         "global UAV barriers per frame: {:.0} emitted, {:.0} skipped_dedup, {:.0} skipped_smart, {:.0} skipped_sync, {:.0} skipped_indirect_uav, {:.0} tex_multi_kept",
                         bs[0], bs[1], bs[2], bs[3], bs[4], bs[5]
                     );
+                }
+                {
+                    let short = &crate::draw::DYNAMIC_SHORT;
+                    let (found, refused) = (short[0].load(Ordering::Relaxed), short[1].load(Ordering::Relaxed));
+                    if found + refused > 0 {
+                        tracing::info!(
+                            "dynamic descriptor slots run out, since the start: {found} found after settling the flights in the air, {refused} refused (their draws dropped; VICTORY_TABLE_SETTLE=0: not settled)"
+                        );
+                    }
                 }
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
