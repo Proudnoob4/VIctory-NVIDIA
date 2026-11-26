@@ -15,14 +15,30 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Per-page lazy GPU-resident state on a `Shadow`.
+const LAZY_EAGER: u8 = 0;
+const LAZY_DEFERRED: u8 = 1;
+const LAZY_FLUSHING: u8 = 2;
+const LAZY_RESYNC: u8 = 3;
+
+#[inline]
+fn is_lazy_held(state: u8) -> bool {
+    state == LAZY_DEFERRED || state == LAZY_FLUSHING
+}
+
+thread_local! {
+    static IN_LAZY_VEH: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Per-page last copied write-watch sequence, paired with a 64-page-per-word
 /// bitmask of uncopied pages so `nothing_new`, `copy_stale`, and
@@ -138,6 +154,7 @@ impl CopiedPages {
         now: u64,
         ranged: u64,
         written: &[(usize, u64)],
+        lazy_state: Option<&[AtomicU8]>,
     ) -> (Vec<(usize, usize, bool)>, Vec<(usize, u64)>) {
         let mut runs: Vec<(usize, usize, bool)> = Vec::new();
         let mut again_at: Vec<(usize, u64)> = Vec::new();
@@ -148,6 +165,7 @@ impl CopiedPages {
         let last = (to - 1) / PAGE;
         let lo = first_page - base;
         let hi = last - base;
+        let lazy_held = |idx: usize| lazy_state.is_some_and(|s| idx < s.len() && is_lazy_held(s[idx].load(Ordering::Acquire)));
         let mut run: Option<(usize, usize, bool)> = None;
         let push_page = |runs: &mut Vec<(usize, usize, bool)>,
                          run: &mut Option<(usize, usize, bool)>,
@@ -180,6 +198,12 @@ impl CopiedPages {
                     break;
                 }
                 let idx = page - base;
+                if lazy_held(idx) {
+                    if let Some((first, next, known)) = run.take() {
+                        runs.push(((first * PAGE).max(from), (next * PAGE).min(to), known));
+                    }
+                    continue;
+                }
                 let taken = self.at[idx].max(ranged);
                 if write <= taken {
                     continue;
@@ -236,6 +260,12 @@ impl CopiedPages {
                 }
                 (None, None) => break,
             };
+            if lazy_held(idx) {
+                if let Some((first, next, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (next * PAGE).min(to), known));
+                }
+                continue;
+            }
             let page = base + idx;
             if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                 self.set(idx, now);
@@ -332,6 +362,16 @@ pub(crate) struct Shadow {
     self_weak: OnceLock<Weak<Shadow>>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Per 64 KiB page lazy GPU-resident state (`LAZY_EAGER`..`LAZY_RESYNC`),
+    /// read/updated lock-free so VEH never acquires any `Shadow` mutex.
+    lazy_state: Vec<AtomicU8>,
+    /// Number of 64 KiB pages currently `LAZY_DEFERRED` or `LAZY_FLUSHING`.
+    deferred_count: AtomicUsize,
+    /// Number of 64 KiB pages currently `LAZY_RESYNC` (flushed by VEH, pending
+    /// staging/hash resync on the next GPU use).
+    resync_count: AtomicUsize,
+    #[cfg(test)]
+    lazy_opted_in: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: AtomicBool,
@@ -3340,6 +3380,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.deferred_count.load(Ordering::Acquire) > 0 || self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_flush_all_on_drop();
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3928,6 +3971,11 @@ impl Shadow {
             card: None,
             self_weak: OnceLock::new(),
             window: false,
+            lazy_state: (0..pages).map(|_| AtomicU8::new(LAZY_EAGER)).collect(),
+            deferred_count: AtomicUsize::new(0),
+            resync_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            lazy_opted_in: false,
             changes_only: Default::default(),
             mapped: false,
             mapped_buffer_size: 0,
@@ -3976,6 +4024,48 @@ impl Shadow {
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() || self.mapped_buffer_size > 0 {
             return;
+        }
+        // Flush overlapping OTHER shadows' deferred pages and resync any
+        // `LAZY_RESYNC` pages ONLY on subranges not already in `self.pending`:
+        // ranges in `self.pending` may be concurrently read/merged by the relay
+        // thread (`card_merge_relay` / `land_card`) and still need their
+        // `FlushedBaseline` intact.
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        let need_other = LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0;
+        let need_resync = self.resync_count.load(Ordering::Acquire) > 0;
+        if from < to && (need_other || need_resync) {
+            let busy_raw: Vec<(usize, usize)> = if self.writes_pending() {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .filter(|&(a, e)| a < to && e > from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let free: Vec<(usize, usize)> = if busy_raw.is_empty() {
+                vec![(from, to)]
+            } else {
+                let busy_pages: Vec<(usize, usize)> = busy_raw
+                    .iter()
+                    .map(|&(a, e)| (a & !(PAGE - 1), e.div_ceil(PAGE).saturating_mul(PAGE)))
+                    .collect();
+                outside(from, to, busy_pages)
+            };
+            for (a, e) in free {
+                if need_other && LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
+                    let flushed = lazy_flush_other_shadows(self.id, a, e);
+                    if !flushed.is_empty() {
+                        self.resync_pages_from_title(&flushed, &busy_raw);
+                    }
+                }
+                if self.resync_count.load(Ordering::Acquire) > 0 {
+                    self.lazy_resync_range(a, e, &busy_raw);
+                }
+            }
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -4087,27 +4177,30 @@ impl Shadow {
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(self: &Arc<Self>, address: usize, len: usize) -> usize {
         self.copy_back_with(address, len, None)
     }
 
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
-    pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+    pub(crate) fn copy_back_with(self: &Arc<Self>, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() || self.mapped_buffer_size > 0 {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if let Some(before_vec) = snapshot.as_mut()
             && from < to
         {
+            if self.resync_count.load(Ordering::Acquire) > 0 {
+                self.lazy_apply_flushed_baseline(from, &mut before_vec[from..to]);
+            }
             // SAFETY: `writing` set the snapshot's bytes of every declared
             // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
+            let before = unsafe { std::slice::from_raw_parts(before_vec.as_ptr().add(from), to - from) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission (on several threads: gigabytes a frame, bound by
             // memory speed), title memory read only where the GPU wrote.
@@ -4132,8 +4225,12 @@ impl Shadow {
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
+            let lazy = lazy_copyback();
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
             for (at, n) in differing {
+                if lazy && self.try_defer_piece(at, at + n) {
+                    continue;
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -4194,7 +4291,7 @@ impl Shadow {
     /// and puts the title's bytes into the copy and the snapshot: the two
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
-    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+    pub(crate) fn relay_merge(self: &Arc<Self>, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -4203,6 +4300,12 @@ impl Shadow {
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_apply_flushed_baseline(at, &mut before[at..at + n]);
+        }
+        if lazy_copyback() && self.try_defer_piece(at, at + n) {
+            return 0;
+        }
         now.clear();
         now.reserve(n);
         // SAFETY: inside the copy's mapping (checked above), read into
@@ -4413,9 +4516,24 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            for &(a, e) in &busy {
+                for page in a / PAGE..e.div_ceil(PAGE) {
+                    if page >= base
+                        && (page - base) < self.lazy_state.len()
+                        && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => stale_pages_in(base, &copied, a, e, &written)
+                .into_iter()
+                .any(|p| !has_deferred || !is_lazy_held(self.lazy_state[p - base].load(Ordering::Acquire))),
             None => true,
         })
     }
@@ -4466,6 +4584,23 @@ impl Shadow {
         // copy in the PC's memory in the snapshot.
         let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        // If any page under in-flight GPU writes is `LAZY_RESYNC` (VEH flushed
+        // a prior flight's GPU writes while `self.data`/snapshot still hold older
+        // bytes), settle in-flight flights cleanly instead of misclassifying
+        // prior GPU writes as fresh CPU writes.
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            for &(a, e) in &busy {
+                for page in a / PAGE..e.div_ceil(PAGE) {
+                    if page >= base
+                        && (page - base) < self.lazy_state.len()
+                        && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
         UNDER_NS[9].fetch_add(1, Ordering::Relaxed);
         for (a, e) in busy {
             let t = std::time::Instant::now();
@@ -4483,6 +4618,9 @@ impl Shadow {
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
+                    .into_iter()
+                    .filter(|&p| !has_deferred || !is_lazy_held(self.lazy_state[p - base].load(Ordering::Acquire)))
+                    .collect()
             };
             UNDER_NS[8].fetch_add(stale.len() as u64, Ordering::Relaxed);
             let t = under_ns(1, t);
@@ -4626,11 +4764,27 @@ impl Shadow {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         TITLE.with_borrow_mut(|title| {
+            let page_idx = (lo / PAGE) - (self.start as usize / PAGE);
+            let st_before = self.lazy_state[page_idx].load(Ordering::Acquire);
+            if is_lazy_held(st_before) {
+                return Ok(None);
+            }
+            if st_before == LAZY_RESYNC {
+                return Err(());
+            }
             title.resize(PAGE, 0);
             let title = &mut title[..n];
             let t = std::time::Instant::now();
             if !crate::host::read_into(lo as *const u8, title) {
                 return Ok(None);
+            }
+            // Re-check after `read_into`: if a concurrent VEH fault (or
+            // `read_into`'s flush) transitioned this page to `LAZY_RESYNC`
+            // after the upfront check, `title` holds prior GPU bytes that must
+            // not be diffed against stale `self.data` / snapshot — settle
+            // in-flight flights instead.
+            if self.lazy_state[page_idx].load(Ordering::Acquire) == LAZY_RESYNC {
+                return Err(());
             }
             let t = under_ns(5, t);
             let _compared = Compared(t);
@@ -4701,6 +4855,43 @@ impl Shadow {
         })
     }
 
+    /// Whether `[address, address + len)` overlaps both `self.pending` and at
+    /// least one `LAZY_RESYNC` page (used by `host::stale_under_flights` for
+    /// UAV-only `Step::GpuWrite` commands without a preceding `Step::Refresh`).
+    pub(crate) fn has_lazy_resync_under_writes(&self, address: usize, len: usize) -> bool {
+        if self.resync_count.load(Ordering::Acquire) == 0 || !self.writes_pending() {
+            return false;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return false;
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        if busy.is_empty() {
+            return false;
+        }
+        let base = start / PAGE;
+        for (a, e) in busy {
+            for page in a / PAGE..e.div_ceil(PAGE) {
+                if page >= base
+                    && (page - base) < self.lazy_state.len()
+                    && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -4715,7 +4906,7 @@ impl Shadow {
             return 0;
         }
         if !self.has_pending.load(Ordering::Acquire) {
-            return self.update_free(from, to);
+            return self.update_free(from, to, &[]);
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -4731,18 +4922,18 @@ impl Shadow {
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
+            for &(a, e) in &busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, &busy);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, &busy);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, &[])
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -4758,6 +4949,9 @@ impl Shadow {
             return true;
         }
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        if self.resync_count.load(Ordering::Acquire) > 0 || lazy_has_other_armed(self.id, from, to) {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
@@ -4792,7 +4986,26 @@ impl Shadow {
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) -> usize {
+        // Flush any overlapping OTHER shadow's deferred pages before querying
+        // write-watch/guards so nested buffers and `Shadow::exact` views see
+        // fresh GPU writes even when `watch::ask_once` is active.
+        if LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
+            let flushed = lazy_flush_other_shadows(self.id, from, to);
+            if !flushed.is_empty() {
+                let base = self.start as usize / PAGE;
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                for page in flushed {
+                    if page >= base {
+                        copied.set(page - base, 0);
+                    }
+                }
+                *self.ranged.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+            }
+        }
+        if self.deferred_count.load(Ordering::Acquire) > 0 || self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_prepare_update(from, to, skip_busy);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -4811,13 +5024,20 @@ impl Shadow {
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let bytes = if self.deferred_count.load(Ordering::Acquire) > 0 {
+            self.copy_unwatched_skipping_deferred(from, to)
+        } else {
+            self.copy(from, to)
+        };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
-        to - from
+        {
+            crate::copystat::add(crate::copystat::C::WholeBytes, bytes as u64);
+            if bytes > 0 {
+                crate::copystat::whole(from, bytes, started.elapsed().as_micros() as u64);
+            }
+        }
+        bytes
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -4839,9 +5059,16 @@ impl Shadow {
         static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
         static SAID: AtomicU64 = AtomicU64::new(0);
         let start = self.start as usize;
+        let base = start / PAGE;
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
         let mut title = [0u8; SAMPLE];
         let mut at = from;
         while at < to {
+            let idx = (at / PAGE) - base;
+            if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
+                at = (at / PAGE + 1) * PAGE;
+                continue;
+            }
             let n = SAMPLE.min(to - at);
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
@@ -4883,15 +5110,37 @@ impl Shadow {
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        // Pages the range holds in part are never noted in `copied`, and
-        // were copied again at every refresh of the range, written or not:
-        // of the heap's buffer views alone two ends for each of 4,400
-        // copies, every frame. A range that was taken whole, and not written
-        // since, is as it was.
-        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
-        let (runs, again_at) = copied.plan_stale_runs(base, start, end, from, to, now, ranged, written);
-        let bytes = if runs.is_empty() {
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        let (runs, again_at) = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            // Pages the range holds in part are never noted in `copied`, and
+            // were copied again at every refresh of the range, written or not:
+            // of the heap's buffer views alone two ends for each of 4,400
+            // copies, every frame. A range that was taken whole, and not written
+            // since, is as it was.
+            let ranged = if crate::watch::light() && !has_deferred { self.ranged(from, to) } else { 0 };
+            let res = copied.plan_stale_runs(
+                base,
+                start,
+                end,
+                from,
+                to,
+                now,
+                ranged,
+                written,
+                has_deferred.then_some(self.lazy_state.as_slice()),
+            );
+            if crate::watch::light() && !has_deferred {
+                // All of the range is in the copy as of this asking.
+                let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+                ranged[0] = (from, to, now);
+                if to - from >= ranged[1].1 - ranged[1].0 {
+                    ranged[1] = (from, to, now);
+                }
+            }
+            res
+        };
+        if runs.is_empty() {
             0
         } else {
             let runs = if again_at.is_empty() {
@@ -4900,16 +5149,7 @@ impl Shadow {
                 by_parts(runs, &again_at, &crate::watch::parts_written(&again_at))
             };
             self.take_all(runs)
-        };
-        if crate::watch::light() {
-            // All of the range is in the copy as of this asking.
-            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-            ranged[0] = (from, to, now);
-            if to - from >= ranged[1].1 - ranged[1].0 {
-                ranged[1] = (from, to, now);
-            }
         }
-        bytes
     }
 
     /// [`Shadow::take`] of `runs` (from, to, known), on several threads if
@@ -5324,6 +5564,9 @@ impl Shadow {
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_apply_flushed_baseline(at, old);
+        }
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
@@ -5384,6 +5627,9 @@ impl Shadow {
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_apply_flushed_baseline(at, held);
+        }
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
@@ -5508,6 +5754,14 @@ impl Shadow {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
+            let _lazy = lazy_flush_and_hold(self.start as usize + lo, hi - lo);
+            if self.resync_count.load(Ordering::Acquire) > 0 {
+                // SAFETY: inside the CPU-side mapping (`hi <= self.len`);
+                // `self.merging.read()` excludes `merge_under_writes` and
+                // `land::ordered` serializes pieces within the same 64 KiB block.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(lo), hi - lo) };
+                self.lazy_apply_flushed_baseline(lo, held);
+            }
             let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
             let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
             // SAFETY: inside the mapping (checked above), in a range
@@ -5530,18 +5784,29 @@ impl Shadow {
     /// block of title memory) of a copy in the PC's memory; on any thread,
     /// as [`Shadow::land_card`]. The copy is read once and never written.
     /// Returns the bytes put into title memory.
-    pub(crate) fn land_back(&self, at: usize, n: usize, notes: &mut crate::land::Notes) -> u64 {
+    pub(crate) fn land_back(self: &Arc<Self>, at: usize, n: usize, notes: &mut crate::land::Notes) -> u64 {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        if lazy_copyback() && self.try_defer_piece(at, at + n) {
             return 0;
         }
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
+        let _lazy = lazy_flush_and_hold(self.start as usize + at, n);
         // The snapshot's memory stays where it is until the range is done
         // with (`copy_back_done`), which comes after this.
         let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Vec::as_mut_ptr) else {
             return 0;
         };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            // SAFETY: `held` holds `self.len` bytes (`writing`), `at + n <= self.len`,
+            // `self.merging.read()` excludes `merge_under_writes`, and same-block
+            // pieces share one job.
+            let held_slice = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
+            self.lazy_apply_flushed_baseline(at, held_slice);
+        }
         // SAFETY: inside the copy's mapping (checked above), which only the
         // card writes there, and inside the snapshot's allocation, which
         // holds the copy's length (`writing`): these offsets are in a range
@@ -5549,7 +5814,7 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, Arc::as_ptr(self)) }
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this
@@ -5851,9 +6116,17 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     );
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; flush any lazy GPU-resident pages before the title
+/// frees or reuses the backing memory, then let lists keep it alive if needed.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let removed = buffers().remove(&(start, resource)).and_then(|e| e.shadow);
+    if let Some(shadow) = removed
+        && shadow.deferred_count.load(Ordering::Acquire) > 0
+    {
+        // Keep `save_baseline = true` because in-flight lists may still hold
+        // `Arc<Shadow>` and settle via `card_merge_relay` / `land_card` / `relay_merge`.
+        shadow.lazy_flush_all(true);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -6761,7 +7034,7 @@ mod batch11_shadow_tests {
                 exp_runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
             }
 
-            let (got_runs, got_again) = fast.plan_stale_runs(base, start, end, from, to, now, ranged, &written);
+            let (got_runs, got_again) = fast.plan_stale_runs(base, start, end, from, to, now, ranged, &written, None);
             assert_eq!(got_runs, exp_runs, "runs step {step}");
             assert_eq!(got_again, exp_again, "again_at step {step}");
             assert_eq!(fast.at, oracle_at, "timestamps step {step}");
@@ -6863,3 +7136,5 @@ mod batch11_shadow_tests {
         assert_eq!(mine[0].1, vec![(256, 512)]);
     }
 }
+
+include!("shadow/lazy.rs");
