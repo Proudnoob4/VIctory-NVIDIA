@@ -1873,6 +1873,20 @@ pub(super) fn wave_ticket_prologue(s: &mut Shader, slot: u32, wave: u32) -> V {
     s.m.bin(joined, Bin::Add, base, lane)
 }
 
+/// The constants follow the program's instructions. A load at a fixed
+/// offset inside the instructions preserves the original table start.
+fn code_table_start(p: &crate::ir::Program, addresses: &[Address], lowest: u32) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below { lowest } else { lowest.max(code_end & !3) }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2259,7 +2273,7 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<Address> = self
                     .x
                     .res
                     .scalar
@@ -2272,9 +2286,9 @@ impl<'a> Lower<'a> {
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -13415,13 +13429,32 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        // s_nop 0, s_endpgm, followed by 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        assert_eq!(code_table_start(&p, &[computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[computed, fixed_after], 0), 8);
+        assert_eq!(code_table_start(&p, &[computed, fixed_inside], 0), 0);
+        assert_eq!(code_table_start(&p, &[fixed_after], 12), 12);
+    }
 
     #[test]
     fn automatic_barriers_keep_fences_and_only_drop_unsafe_sync() {
