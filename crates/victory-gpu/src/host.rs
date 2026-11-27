@@ -317,6 +317,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     }
     MAPPED_DONE.store(cover, Ordering::Release);
     let us = started.elapsed().as_micros() as u64;
+    long_wait("mapped into the card's address space", us);
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
@@ -329,6 +330,20 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Logs one of the first 60 waits for new memory of over 20 ms, with the
+/// thread that waited (which of them hold frames up).
+fn long_wait(what: &str, us: u64) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if us >= 20_000 && SAID.fetch_add(1, Ordering::Relaxed) < 60 {
+        let thread = std::thread::current();
+        tracing::info!(
+            ms = us as f64 / 1000.0,
+            thread = thread.name().unwrap_or("(title)"),
+            "a long wait for new memory: {what}"
+        );
+    }
 }
 
 /// Times, microseconds and the longest of [`mapped`].
@@ -344,6 +359,7 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     // SAFETY: a live heap or resource of the device's.
     let made = unsafe { device.MakeResident(&[Some(object)]) };
     let us = started.elapsed().as_micros() as u64;
+    long_wait("made resident", us);
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
@@ -9796,6 +9812,48 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// `VICTORY_PRESENT_SYNC=1..4`: presents wait for that many refreshes of the
+/// display, so that on one without variable refresh every frame is shown
+/// for the same time (at 120 Hz: 4 is 30 fps, 2 is 60); 0 or unset: shown
+/// at the next refresh, as before.
+fn present_sync() -> u32 {
+    static SYNC: OnceLock<u32> = OnceLock::new();
+    *SYNC.get_or_init(|| {
+        let n = std::env::var("VICTORY_PRESENT_SYNC").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(4);
+        if n > 0 {
+            tracing::info!(n, "presents wait for the display's refreshes (VICTORY_PRESENT_SYNC)");
+        }
+        n
+    })
+}
+
+/// The frame pacing of the last 5 s: percentiles of the time from one
+/// present to the next, the longest, how many took over twice the median
+/// or over 50 ms (stutters), and the mean change from one to the next.
+fn pace_line(intervals: Vec<u32>) {
+    if intervals.len() < 2 {
+        return;
+    }
+    let change = intervals.windows(2).map(|w| u64::from(w[0].abs_diff(w[1]))).sum::<u64>() as f64
+        / (intervals.len() - 1) as f64
+        / 1000.0;
+    let mut sorted = intervals;
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let at = |q: f64| f64::from(sorted[((n - 1) as f64 * q).round() as usize]) / 1000.0;
+    let median = at(0.5);
+    let over = |ms: f64| sorted.iter().filter(|&&us| f64::from(us) / 1000.0 > ms).count();
+    tracing::info!(
+        "present intervals (frame pacing) over {n} frames: p50 {median:.2} ms, p95 {:.2} ms, p99 {:.2} ms, max {:.2} ms; \
+         {} over twice the median, {} over 50 ms; mean change from one frame to the next {change:.2} ms",
+        at(0.95),
+        at(0.99),
+        at(1.0),
+        over(2.0 * median),
+        over(50.0)
+    );
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -9806,6 +9864,10 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    /// Microseconds from one present to the next since the last line of
+    /// every 5 s ([`pace_line`]), and when the last present was.
+    intervals: Vec<u32>,
+    last_present: Option<std::time::Instant>,
 }
 
 impl Meter {
@@ -9820,6 +9882,8 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            intervals: Vec::with_capacity(1024),
+            last_present: None,
         }
     }
 
@@ -9840,6 +9904,12 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
+        }
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_present.replace(now)
+            && self.intervals.len() < 1 << 16
+        {
+            self.intervals.push(now.duration_since(prev).as_micros().min(u128::from(u32::MAX)) as u32);
         }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
@@ -9971,7 +10041,9 @@ impl Meter {
             let logged_frames = std::mem::take(&mut self.logged_frames).max(1) as f64;
             #[cfg(feature = "diagnostics")]
             let copy_stats_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
+            let intervals = std::mem::replace(&mut self.intervals, Vec::with_capacity(1024));
             meter_lines(move || {
+                pace_line(intervals);
                 tracing::info!(
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -10320,7 +10392,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p.swap_chain.Present(present_sync(), DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
