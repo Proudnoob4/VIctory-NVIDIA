@@ -1,4 +1,42 @@
-# VIctory on NVIDIA
+# VIctory on NVIDIA (`nvidia-hybrid-v2`)
+
+## Latest verified status (2026-11-27, Pass 47–49)
+
+Measured on Windows 10 (Agility SDK 620), Intel Core i5-13600K (6P+8E, 20 threads), 32 GB RAM, **RTX 4080 16 GB** (ReBAR off), Series S profile at 540p (`scripts\play-nvidia.ps1`, `release` build with `mimalloc` default):
+
+| Scene / Metric | Uncapped (`Pass 48b`, `VICTORY_CARD_STEPS=1`) | Locked 30 fps + Warm Shaders/PSOs (`Pass 49`, default) |
+|---|---|---|
+| Diner (`115–170 s`) | **31.3 fps** med (`17.8–40.4`), `prep 24.2 ms` | **29.0 fps** med (`prep 25.6 ms`, warm `made=0 / loaded=2614`) |
+| Cell early (`170–230 s`) | **32.8 fps** med (`26.6–36.9`), `prep 22.1 ms` | **30.0 fps** (`min 30.0 / max 30.0`, `prep 20.5 ms`) |
+| Cell steady (`230–315 s`) | **38.3 fps** med (`27.3–47.8`), `prep 20.4 ms` | **30.0 fps** (`29.4–30.6`, `prep 20.9 ms`) |
+| Hallway (`315–370 s`) | **41.9 fps** med (`37.7–44.1`), `prep 18.1 ms` | **30.0 fps** (`28.1–32.1`, `prep 18.2 ms`) |
+| Common room (`370–490 s`) | **34.8–41.8 fps** med (`max 44.8`), `prep 18.9 ms` | **30.0 fps** (`min 30.0 / max 30.0`, `prep 18.9 ms`) |
+| Office (`490–605 s`) | **33.4–35.0 fps** med (`max 47.4`), `prep 17.7–22.8 ms` | **30.0 fps** (`29.9–30.6`, `prep 17.7 ms`, `gpu 1.0 ms`) |
+| 1-frame vertex stretches | **0** across 600 s | **0** across 600 s |
+| Device losses / crashes | **0** | **0** |
+
+### What changed since `2dea829`
+
+- **Runtime Agility SDK loading** (`Marvisak/VIctory#969`, `crates/victory-shader/src/emit/agility.rs`): loads `D3D12\D3D12Core.dll` dynamically via `ID3D12SDKConfiguration1::CreateDeviceFactory` instead of statically exporting `D3D12SDKVersion`/`D3D12SDKPath`. Fixes `0x887E0003` on Windows 11 26200 without a local `D3D12\` folder while keeping Windows 10 working when `D3D12\D3D12Core.dll` sits beside `victory.exe` (or `VICTORY_D3D12_AGILITY=<dir>`).
+- **Allocator, heap, & scratch pooling**: `mimalloc` default allocator (`trustno1-coder#11`), cached `HostHeap::gpu` handle (`KyleS98/034bdca` / `fxceless#1117`), reusable 4 MiB / 512 MiB list scratch chunk pool (`fxceless#1367`, `@Ym1r1710`), `diagnostics`-gated `PLACED_RAW`/`PLACED_TWINS` (`trustno1-coder#13`), saturating big-compare slice cut (`fxceless#1407`), per-list depth-plane SRV heap lifetime (`fxceless#1377`), coalesced `mapped()` waits, `staging_rw_buffer`, `VICTORY_AFFINITY=free`, `VICTORY_PLANE_NOW=1`, `VICTORY_LIST_ALIAS_EXACT=1`, `VICTORY_E5_TARGETS=r11g11b10`, and 43 RT-only `bvh_skinning`/`CS_Primary_GatherCopy` skips (`scripts/rt_work_off_hashes.txt`, `@Dathinel`).
+- **Visual fixes**:
+  - **Trees restored on NVIDIA** (`oz-stanislav-zhukov@2ce00838`, `VICTORY_LDS_LEGACY=1` default): restores tree culling shaders (`55679a0547649d0b`, `89d08e561897d4e5`) refused after Batch 7.
+  - **Interior fog haze removed** (`Dathinel/victory-4gb#15`, `VICTORY_AMBIENT_SETTLE=250,3` + `VICTORY_AMBIENT_MARCH=3`): clock-based room ambient with cut jumps + clamping `CS_ReconstructRaymarchClassified*` gathered in-scatter.
+  - **Transparent glass/windows & clamped reflections** (`readmet3xt-lab/foxhound` `Role::Miss` + pure downward luminance clamp in `ambient.rs` / `draw.rs`, `VICTORY_AMBIENT_SPECULAR=0.8,0.1`, `VICTORY_AMBIENT_SPECULAR_ALPHA=clamp`): clamps 10–30x open-sky `CS_RayMiss` reflections for both `opaque` and `alpha` (glass/windows) without raising dark pixels or reading opaque depth behind glass/water.
+  - **Clean character skin bakes** (`fxceless#1422` `within_budget` for forced bake sources, `VICTORY_BAKE_TEXTURES_MS=1500`, `VICTORY_TEXTURE_NO_WAIT=0`).
+  - **Zero 1-frame vertex stretches & cross-GPU safety**: `VICTORY_CARD_STEPS=1` default (per `@d0dev` on `fxceless#1268` and Pass 48b/49), ReBAR BAR caps omitted from defaults (render 3D black with ReBAR on), `VICTORY_STREAM_REFRESH` left CPU-default (faster ON on Ryzen 5800X per `@Victorywillbeours222`), `VICTORY_KEEP_PAGES=0` (`AvailMB min` `30 -> 422 MB` on 32 GB).
+- **Precision frame pacer & `-Warm` launcher helper**: hybrid sleep + 1.5 ms busy-spin in `frame.rs` (`VICTORY_PRECISE_PACE=1`) locks native 30.000 fps (`33.33 ms`) cleanly for Smooth Motion (`victory_sm.exe`, 60 fps) or Lossless Scaling without game-logic speedup; pass `-TargetFps 120` to uncap. Run `scripts\play-nvidia.ps1 -Exe <path> -Warm` once after building to precompile all shaders (`victory shaders`, ~70 s) and used D3D12 PSOs (`victory warm --used`).
+
+### Quick start
+
+```powershell
+cargo build --release -p victory
+# First run records used pipelines (VICTORY_PIPELINE_BOOK=1); or precompile shaders + PSOs ahead of time:
+scripts\play-nvidia.ps1 -Exe "<path>\game_scarlett_master.exe" -Warm
+scripts\play-nvidia.ps1 -Exe "<path>\game_scarlett_master.exe"
+```
+
+---
 
 ## Built from many projects
 
