@@ -43,6 +43,15 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// A compute pipeline whose dispatches wait outside the graphics budget.
+    compute: bool,
+    compute_dropped: AtomicBool,
+    compute_given_up: AtomicBool,
+    /// When a worker began making it, excluding time in the queue.
+    making_since: OnceLock<Instant>,
+    /// Lets a scheduler test publish its result only once the caller waits.
+    #[cfg(test)]
+    wait_entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// LOCAL: how long draws have waited for it so far, in microseconds
     /// ([`wait_once`]).
     waited_us: AtomicU64,
@@ -71,6 +80,14 @@ impl Pending {
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            compute: graphics.is_none()
+                && shaders.first().is_some_and(|s| s.stage == "compute")
+                && compute_waits(),
+            compute_dropped: AtomicBool::new(false),
+            compute_given_up: AtomicBool::new(false),
+            making_since: OnceLock::new(),
+            #[cfg(test)]
+            wait_entered: Mutex::new(None),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -87,6 +104,7 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.making_since.get_or_init(Instant::now);
         self.made.get_or_init(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
@@ -216,6 +234,10 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    ready_with(p, &WAIT_STATE)
+}
+
+fn ready_with<'a>(p: &'a Arc<Pending>, waits: &WaitState) -> Option<&'a HostPipeline> {
     // A still-pending pipeline was requested by the title too. Prewarm it
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
@@ -223,7 +245,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p, crate::frame::current(), waits);
     }
     p.made.get()?.as_ref()
 }
@@ -272,15 +294,82 @@ fn wait_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// A once-only compute dispatch loses its output for the whole session if
+/// its pipeline is still queued after the graphics budget is spent. Under
+/// Wine, wait separately and promote it ahead of requested graphics. This
+/// is not Wine-specific, but other hosts retain their defaults until tested.
+/// `VICTORY_COMPUTE_WAIT=1` enables it anywhere; `0` disables it.
+/// Ported from Beqren's f63017a (avatarmanz/VIctory-7900XTX#166).
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::wine::on_under_wine("VICTORY_COMPUTE_WAIT");
+        if on {
+            tracing::info!(secs = COMPUTE_BUDGET.as_secs(), "compute dispatches wait for their pipelines");
+        }
+        on
+    })
+}
+
+/// One wall-clock deadline for all compute waits in a frame, also the
+/// maximum age of a worker's unfinished compute job. Queuing is separate:
+/// a dispatch promotes its pipeline before waiting. The default graphics
+/// and screen budgets plus this bound stay below the title's watchdog.
+const COMPUTE_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct ComputeDeadline {
+    first: Option<(u64, Instant)>,
+}
+
+impl ComputeDeadline {
+    fn left(&mut self, frame: u64, now: Instant, making: Duration) -> Duration {
+        // An older recording thread must not reset a newer frame's budget.
+        if self.first.is_none_or(|(first_frame, _)| frame > first_frame) {
+            self.first = Some((frame, now));
+        }
+        let (_, began) = self.first.unwrap();
+        COMPUTE_BUDGET
+            .saturating_sub(now.saturating_duration_since(began))
+            .min(COMPUTE_BUDGET.saturating_sub(making))
+    }
+}
+
+/// Distinct accounting: compute callers share a deadline, while ordinary
+/// and screen callers reserve portions of their accumulated frame budgets.
+struct WaitState {
+    compute_first: Mutex<ComputeDeadline>,
+    spent: [Mutex<(u64, Duration)>; 2],
+}
+
+impl WaitState {
+    const fn new() -> Self {
+        Self {
+            compute_first: Mutex::new(ComputeDeadline { first: None }),
+            spent: [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2],
+        }
+    }
+}
+
+static WAIT_STATE: WaitState = WaitState::new();
+
 /// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+fn wait(p: &Pending, frame: u64, waits: &WaitState) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
+    let making = p.making_since.get().map_or(Duration::ZERO, Instant::elapsed);
+    let compute = p.compute && making < COMPUTE_BUDGET;
+    let budget = if screen {
+        screen_budget()
+    } else if compute {
+        COMPUTE_BUDGET
+    } else {
+        wait_budget()
+    };
     if budget.is_zero() {
         return;
     }
     // LOCAL: what is left of this pipeline's own budget ([`wait_once`]).
-    let own = if wait_once() {
+    let own = if !compute && wait_once() {
         let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
         if own.is_zero() {
             return;
@@ -291,10 +380,14 @@ fn wait(p: &Pending, frame: u64) {
     };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-    let spent_of = &SPENT[usize::from(screen)];
+    let spent_of = &waits.spent[usize::from(screen)];
     let shared = shared_budget();
-    let left = {
+    let left = if compute {
+        waits.compute_first
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .left(frame, Instant::now(), making)
+    } else {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
@@ -306,6 +399,13 @@ fn wait(p: &Pending, frame: u64) {
         left
     };
     if left.is_zero() {
+        if compute && p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                shaders = %hashes(p),
+                frame,
+                "a compute dispatch was dropped: this frame's compute wait deadline expired"
+            );
+        }
         return;
     }
     let started = Instant::now();
@@ -316,11 +416,15 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
+        #[cfg(test)]
+        if let Some(entered) = p.wait_entered.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = entered.send(());
+        }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    if wait_once() && p.made.get().is_none() {
+    if !compute && wait_once() && p.made.get().is_none() {
         let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
         if Duration::from_micros(before) + waited >= budget {
             tracing::info!(
@@ -338,7 +442,7 @@ fn wait(p: &Pending, frame: u64) {
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
     }
-    {
+    if !compute {
         let mut spent = spent_of.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
         if spent.0 == frame {
@@ -348,6 +452,24 @@ fn wait(p: &Pending, frame: u64) {
                 spent.1 += waited;
             }
         }
+    }
+    if compute && p.made.get().is_none() && !p.compute_dropped.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            shaders = %hashes(p),
+            frame,
+            waited_ms = waited.as_millis() as u64,
+            "a compute dispatch was dropped: its pipeline was not made within this frame's compute waits"
+        );
+    }
+    if compute
+        && p.made.get().is_none()
+        && p.making_since.get().is_some_and(|at| at.elapsed() >= COMPUTE_BUDGET)
+        && !p.compute_given_up.swap(true, Ordering::Relaxed)
+    {
+        tracing::warn!(
+            shaders = %hashes(p),
+            "a compute pipeline was not made in 10 s: its dispatches use the ordinary budget from now on"
+        );
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
@@ -384,6 +506,8 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Requested compute pipelines: before requested graphics, after screen passes.
+    compute: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -396,6 +520,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            compute: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -417,6 +542,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && p.compute {
+            self.compute.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -434,7 +561,9 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self.compute.pop_front()
+                .or_else(|| self.requested.pop_front())
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -669,5 +798,103 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn waiting_compute_dispatches_precede_graphics_and_are_claimed_once() {
+        let of = |compute, screen| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.compute = compute;
+            p.screen = screen;
+            Arc::new(p)
+        };
+        let (world, compute, screen, early) =
+            (of(false, false), of(true, false), of(false, true), of(false, false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&compute, EARLY), Some(true));
+        assert_eq!(queue.push(&early, EARLY), Some(true));
+        assert_eq!(queue.push(&world, REQUESTED), Some(true));
+        assert_eq!(queue.push(&compute, REQUESTED), Some(false));
+        assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
+        assert!(queue.pop(true, 1).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &compute));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &early));
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn compute_deadline_is_shared_and_older_frames_cannot_renew_it() {
+        let start = Instant::now();
+        let seconds = Duration::from_secs;
+        let mut deadline = ComputeDeadline::default();
+        assert_eq!(deadline.left(20, start, Duration::ZERO), COMPUTE_BUDGET);
+        // A second caller does not find a reservation that excludes it.
+        assert_eq!(deadline.left(20, start + seconds(3), Duration::ZERO), seconds(7));
+        // Time already spent compiling limits this caller more tightly.
+        assert_eq!(deadline.left(20, start + seconds(3), seconds(8)), seconds(2));
+        assert_eq!(deadline.left(20, start + seconds(10), Duration::ZERO), Duration::ZERO);
+        assert_eq!(deadline.left(19, start + seconds(11), Duration::ZERO), Duration::ZERO);
+        assert_eq!(deadline.left(21, start + seconds(12), Duration::ZERO), COMPUTE_BUDGET);
+        assert_eq!(deadline.left(20, start + seconds(13), Duration::ZERO), seconds(9));
+        assert_eq!(deadline.left(21, start + seconds(13), COMPUTE_BUDGET), Duration::ZERO);
+    }
+
+    /// Exercise the ready path itself after graphics and cumulative waits
+    /// are exhausted. The result is published only once the caller enters
+    /// the condition wait; no sleep or driver pipeline is needed.
+    #[test]
+    fn ready_compute_waits_for_publication_after_graphics_budget_is_spent() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.compute = true;
+        p.used.store(true, Ordering::Relaxed);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        p.making_since.set(Instant::now()).unwrap();
+        p.waited_us.store(u64::MAX, Ordering::Relaxed);
+        let (entered, waiting) = std::sync::mpsc::channel();
+        *p.wait_entered.lock().unwrap() = Some(entered);
+        let p = Arc::new(p);
+        let waits = WaitState::new();
+        *waits.spent[0].lock().unwrap() = (crate::frame::current(), Duration::MAX);
+        std::thread::scope(|scope| {
+            let caller = scope.spawn(|| {
+                assert!(ready_with(&p, &waits).is_none());
+                p.made.get().is_some()
+            });
+            let entered = waiting.recv_timeout(Duration::from_secs(2));
+            // Publish a terminal host refusal, just as a worker does. Holding
+            // DONE also guarantees that the notification cannot be missed.
+            let held = DONE.0.lock().unwrap();
+            assert!(p.made.set(None).is_ok());
+            DONE.1.notify_all();
+            drop(held);
+            assert!(caller.join().unwrap(), "ready returned before the worker result");
+            assert!(entered.is_ok(), "the compute caller did not wait: {entered:?}");
+        });
+        assert!(!p.compute_dropped.load(Ordering::Relaxed));
+        assert_eq!(waits.spent[0].lock().unwrap().1, Duration::MAX);
+    }
+
+    #[test]
+    fn expired_compute_deadline_and_old_workers_do_not_restart_long_waits() {
+        let waits = WaitState::new();
+        let frame = crate::frame::current();
+        *waits.spent[0].lock().unwrap() = (frame, Duration::MAX);
+        waits.compute_first.lock().unwrap().first = Some((frame, Instant::now() - COMPUTE_BUDGET));
+        let mut p = Pending::new(Vec::new(), None);
+        p.compute = true;
+        p.used.store(true, Ordering::Relaxed);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        assert!(ready_with(&p, &waits).is_none());
+        assert!(p.compute_dropped.load(Ordering::Relaxed));
+        assert!(p.made.get().is_none());
+        // A worker older than the compute bound uses the exhausted ordinary
+        // budget, even when a newer frame has a fresh compute deadline.
+        p.making_since.set(Instant::now() - COMPUTE_BUDGET).unwrap();
+        waits.compute_first.lock().unwrap().first = None;
+        assert!(ready_with(&p, &waits).is_none());
+        assert!(waits.compute_first.lock().unwrap().first.is_none());
     }
 }

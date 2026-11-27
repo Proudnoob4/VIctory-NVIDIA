@@ -492,7 +492,37 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
     drop(blob);
-    let library = make(&[]).ok()?;
+    // An empty slice still has a non-null address. vkd3d-proton rejects
+    // that address with a zero blob length, leaving no pipeline library.
+    // Use the raw API to express an absent blob; the slice wrapper cannot.
+    // Ported from Beqren's 912d6f2 (avatarmanz/VIctory-7900XTX #166),
+    // following AugustoZFJ's Marvisak/VIctory #347.
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: no blob is read. On success, a non-null output owns one
+    // ID3D12PipelineLibrary reference, transferred to the wrapper below.
+    let made = unsafe {
+        (Interface::vtable(device).CreatePipelineLibrary)(
+            Interface::as_raw(device),
+            std::ptr::null(),
+            0,
+            &ID3D12PipelineLibrary::IID,
+            &mut raw,
+        )
+        .ok()
+        .and_then(|()| {
+            if raw.is_null() {
+                return Err(windows::Win32::Foundation::E_POINTER.into());
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast::<ID3D12PipelineLibrary1>()
+        })
+    };
+    let library = match made {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::info!(error = %e, "the host refused an empty pipeline library");
+            return None;
+        }
+    };
     Some(Library {
         library,
         _blob: Blob::None,
@@ -805,6 +835,31 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
+    }
+
+    /// A fresh cache starts a library under vkd3d-proton, and its serialized
+    /// bytes can be loaded by the unchanged non-empty blob path.
+    #[test]
+    fn an_empty_library_can_be_serialized_and_loaded() {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return; // no host GPU here
+        };
+        let library = open(&device, Blob::None).expect("an empty library");
+        assert!(matches!(library._blob, Blob::None));
+        // SAFETY: plain queries on the live library, with a buffer of the
+        // exact size it requests for serialization.
+        let bytes = unsafe {
+            let size = library.library.GetSerializedSize();
+            assert!(size > 0);
+            let mut bytes = vec![0; size];
+            library.library.Serialize(&mut bytes).expect("serialized empty library");
+            bytes
+        };
+        drop(library);
+        let loaded = open(&device, Blob::Held(bytes)).expect("a reloaded library");
+        // If the host rejected the serialized bytes, open would fall back
+        // to Blob::None. Check that it actually accepted the saved blob.
+        assert!(matches!(loaded._blob, Blob::Held(_)));
     }
 
     /// A mapped file reads as the file's bytes, a file written through a
