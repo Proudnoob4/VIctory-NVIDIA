@@ -238,6 +238,10 @@ impl Recording {
                     return;
                 };
                 if inner.back == 0 {
+                    if self.abandoned.load(Acquire) {
+                        inner.kept.push(chunk);
+                        continue;
+                    }
                     inner.back = back_list(self.kind) as usize;
                 }
                 (chunk, inner.back as This)
@@ -264,6 +268,7 @@ impl Recording {
 
 impl Drop for Recording {
     fn drop(&mut self) {
+        const BACKS_MAX: usize = 256;
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
@@ -272,7 +277,19 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            let keep = {
+                let mut backs = held(&BACKS);
+                if backs.len() < BACKS_MAX {
+                    backs.push(inner.back);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !keep {
+                // SAFETY: our boxed back-list shell, no longer referenced.
+                drop(unsafe { Box::from_raw(inner.back as *mut List) });
+            }
         }
     }
 }
@@ -287,16 +304,16 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// A list shell of ours: its `HostList` is claimed from `IDLE` inside `reset()`
+/// when translation begins, and taken by `detach_thin()` on unfold so idle
+/// shells in `BACKS` hold zero D3D12 command allocators.
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
-    list
+    Box::into_raw(super::boxed_back(kind)).cast_const().cast()
 }
 
 fn start() {

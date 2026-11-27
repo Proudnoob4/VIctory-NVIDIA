@@ -258,7 +258,7 @@ struct Pools {
 }
 
 impl Pools {
-    const SHARDS: usize = 8;
+    const SHARDS: usize = 32;
 
     fn new(n: usize) -> Self {
         // (Round up: the shards must cover every slot, the last a little less.)
@@ -288,9 +288,44 @@ impl Pools {
         if n > self.size {
             return self.take_wide(n);
         }
-        let first = self.next.fetch_add(1, Relaxed) % self.shards.len();
-        for i in 0..self.shards.len() {
-            let shard = (first + i) % self.shards.len();
+        thread_local! {
+            static PREFERRED: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+        }
+        let nshards = self.shards.len();
+        let first = PREFERRED.with(|c| {
+            let mut s = c.get();
+            if s == usize::MAX {
+                s = self.next.fetch_add(1, Relaxed) % nshards;
+                c.set(s);
+            }
+            s % nshards
+        });
+        // Non-blocking first pass: skip any shard currently held by another
+        // recording thread or `victory-relay` so threads never form lock convoys.
+        let mut contended = false;
+        for i in 0..nshards {
+            let shard = (first + i) % nshards;
+            match self.shards[shard].try_lock() {
+                Ok(mut pool) => {
+                    if let Some(local) = pool.take(n) {
+                        return Some(shard * self.size + local);
+                    }
+                }
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    if let Some(local) = e.into_inner().take(n) {
+                        return Some(shard * self.size + local);
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    contended = true;
+                }
+            }
+        }
+        if !contended {
+            return None;
+        }
+        for i in 0..nshards {
+            let shard = (first + i) % nshards;
             let mut pool = self.shards[shard].lock().unwrap_or_else(|e| e.into_inner());
             if let Some(local) = pool.take(n) {
                 return Some(shard * self.size + local);
@@ -350,6 +385,42 @@ impl Pools {
         given
     }
 
+    /// Gives back many `(at, n)` ranges in one pass, locking each touched shard
+    /// at most once instead of once per table.
+    fn give_batch(&self, ranges: &[(usize, usize)]) -> u32 {
+        if ranges.len() <= 1 {
+            return ranges.first().map_or(0, |&(at, n)| self.give(at, n));
+        }
+        let nshards = self.shards.len();
+        let mut per_shard: Vec<(usize, usize, usize)> = Vec::with_capacity(ranges.len());
+        for &(at, n) in ranges {
+            let mut left = at;
+            let end = at + n;
+            while left < end {
+                let shard = (left / self.size).min(nshards - 1);
+                let shard_end = ((shard + 1) * self.size).min(end);
+                per_shard.push((shard, left - shard * self.size, shard_end - left));
+                left = shard_end;
+            }
+        }
+        per_shard.sort_unstable_by_key(|&(shard, local, _)| (shard, local));
+        let mut given = 0u32;
+        let mut i = 0;
+        while i < per_shard.len() {
+            let shard = per_shard[i].0;
+            let mut j = i + 1;
+            while j < per_shard.len() && per_shard[j].0 == shard {
+                j += 1;
+            }
+            let mut pool = self.shards[shard].lock().unwrap_or_else(|e| e.into_inner());
+            for &(_, local, len) in &per_shard[i..j] {
+                given += pool.give(local, len);
+            }
+            i = j;
+        }
+        given
+    }
+
     fn taken(&self, at: usize) -> Option<bool> {
         let shard = (at / self.size).min(self.shards.len() - 1);
         let pool = self.shards[shard].lock().unwrap_or_else(|e| e.into_inner());
@@ -365,6 +436,7 @@ pub(crate) struct HostHeap {
     id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -1265,8 +1337,13 @@ impl Queued {
 
     /// Whether `slot` may be in the queue.
     fn may(&self, slot: u32) -> bool {
-        let word = self.0.get(slot as usize / 64);
-        word.is_none_or(|w| w.load(std::sync::atomic::Ordering::SeqCst) >> (slot % 64) & 1 != 0)
+        self.holds(slot) != Some(false)
+    }
+
+    /// Whether `slot` is in the queue; `None`: not known.
+    fn holds(&self, slot: u32) -> Option<bool> {
+        let word = self.0.get(slot as usize / 64)?;
+        Some(word.load(std::sync::atomic::Ordering::SeqCst) >> (slot % 64) & 1 != 0)
     }
 }
 
@@ -1324,33 +1401,71 @@ impl TextureQueue {
     ///   index read an empty slot (black) or an older view (red, noise).
     #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        Self::in_order(self.all_due(frame), max)
+        Self::in_order(self.all_due_and_census(frame, true).0, max)
     }
 
-    /// The slots due at `frame`, for [`TextureQueue::in_order`].
-    fn all_due(&self, frame: u64) -> Due {
+    /// The slots due at `frame`, for [`TextureQueue::in_order`], fused with
+    /// [`TextureQueue::census`] into a single pass over `self.slots` to halve
+    /// hold time on `HostHeap::textures`.
+    fn all_due_and_census(&self, frame: u64, collect_due: bool) -> (Due, [u64; 5]) {
         let mut due = Due::default();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                c[3] += 1;
+            } else if w.looks > 0 {
+                c[2] += 1;
+            }
+            if w.due <= frame {
+                c[1] += 1;
+                c[4] = c[4].max(frame.saturating_sub(w.written));
+                if collect_due {
+                    due[usize::from(w.looks == 0 && w.mapped == 0)].push((w.written, index, w.write));
+                }
+            }
         }
-        due
+        (due, c)
     }
 
-    /// What [`TextureQueue::due`] says of `due` (with nothing held: some
-    /// ten thousand slots are sorted).
+    /// What [`TextureQueue::due`] says of `due` (with nothing held: partitions
+    /// before sorting so a 40,000-slot streaming queue only sorts `<= max`).
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
+        if max == 0 {
+            return Vec::new();
+        }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && fresh_order.len() < max {
-            fresh_order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && fresh_order.len() < max {
-                old -= 1;
-                fresh_order.push((fresh[old].1, fresh[old].2));
+        let take = fresh.len().min(max);
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(take);
+        if take > 0 {
+            let new_count = take.div_ceil(2);
+            let old_count = take / 2;
+            if new_count < fresh.len() {
+                fresh.select_nth_unstable_by(new_count, newest_first);
+            }
+            let (newest, rest) = fresh.split_at_mut(new_count);
+            newest.sort_unstable_by(newest_first);
+            let oldest = if old_count > 0 {
+                let oldest_at = rest.len() - old_count;
+                if oldest_at > 0 {
+                    rest.select_nth_unstable_by(oldest_at, newest_first);
+                }
+                let oldest = &mut rest[oldest_at..];
+                oldest.sort_unstable_by(|a, b| newest_first(b, a));
+                &*oldest
+            } else {
+                &[][..]
+            };
+            for (pos, &entry) in newest.iter().enumerate() {
+                fresh_order.push((entry.1, entry.2));
+                if let Some(&old) = oldest.get(pos) {
+                    fresh_order.push((old.1, old.2));
+                }
             }
         }
         let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
@@ -2003,6 +2118,7 @@ impl HostHeap {
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -2204,7 +2320,7 @@ impl HostHeap {
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
         let (due, census) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            (if max == 0 { Due::default() } else { textures.all_due(frame) }, textures.census(frame))
+            textures.all_due_and_census(frame, max != 0)
         };
         (TextureQueue::in_order(due, max), census)
     }
@@ -2888,6 +3004,12 @@ impl HostHeap {
         if !(texture && !read_now) && !self.queued.may(index) {
             return;
         }
+        // A slot made from a view (not written) that the queue holds stays
+        // as it is (`TextureQueue::written`): nothing to take the lock for
+        // (foxhound 2ad55e6's queue marks, by way of Op-lite/victory-scarlett).
+        if texture && !read_now && seen && self.queued.holds(index) == Some(true) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -3062,6 +3184,25 @@ impl HostHeap {
         }
     }
 
+    /// Gives back many dynamic slot ranges of this heap in one batched pass.
+    pub(crate) fn release_batch(&self, id: u64, ranges: &[(u32, u32)]) {
+        if id != self.id || ranges.is_empty() {
+            return;
+        }
+        let local: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter_map(|&(first, n)| {
+                let at = first.checked_sub(self.count)?;
+                let end = (at + n).min(self.dynamic);
+                (end > at).then_some((at as usize, (end - at) as usize))
+            })
+            .collect();
+        if !local.is_empty() {
+            let given = self.pool.give_batch(&local);
+            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -3102,7 +3243,7 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let kept = make_twinned(&view, views.slot(at), twins.then(|| views.slot(at + 1)))?;
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
                     texture: is_texture_view(&view),
@@ -3177,23 +3318,35 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
-            return;
-        };
-        let old = {
-            use windows::core::Interface;
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
-            }
-            std::mem::replace(&mut *slot, resource)
-        };
-        // A running submission may still read the old resource through
-        // this slot.
-        if let Some(old) = old {
+        if let Some(old) = self.keep_swap(index, resource) {
             crate::host::retire_resource(old);
         }
+    }
+
+    /// Swaps slot `index`'s held resource and returns the displaced resource
+    /// without touching the global retire queue.
+    fn keep_swap(&self, index: u32, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
+        let slot = self.kept.get(index as usize)?;
+        use windows::core::Interface;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        // The same again: nothing to retire.
+        if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            return None;
+        }
+        std::mem::replace(&mut *slot, resource)
+    }
+
+    /// Fast-path of [`HostHeap::keep_swap`] for a live `&ID3D12Resource`:
+    /// avoids COM `AddRef`/`Release` when the slot already holds `buffer`.
+    fn keep_ref_swap(&self, index: u32, buffer: &ID3D12Resource) -> Option<ID3D12Resource> {
+        let slot = self.kept.get(index as usize)?;
+        use windows::core::Interface;
+        let raw = buffer.as_raw();
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().map(Interface::as_raw) == Some(raw) {
+            return None;
+        }
+        std::mem::replace(&mut *slot, Some(buffer.clone()))
     }
 
     /// What slot `index` views.
@@ -3306,10 +3459,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -3323,11 +3474,43 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        // SAFETY: a live buffer that holds the range.
+        let base_gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        self.constant_at_offset(index, buffer, base_gpu, gpu.saturating_sub(base_gpu), size);
+    }
+
+    pub(crate) fn constant_at_offset(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        base_gpu: u64,
+        offset: u64,
+        size: u32,
+    ) {
+        let mut retired = Vec::new();
+        self.constant_at_offset_batched(index, buffer, base_gpu, offset, size, &mut retired);
+        for old in retired {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::constant_at_offset`] for one of many slots made together:
+    /// what the slot showed before goes into `retired`, which the caller
+    /// retires at once ([`crate::host::retire_resources_batch`]).
+    pub(crate) fn constant_at_offset_batched(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        base_gpu: u64,
+        offset: u64,
+        size: u32,
+        retired: &mut Vec<ID3D12Resource>,
+    ) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
+            BufferLocation: base_gpu + offset,
             SizeInBytes: constant_bytes(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
@@ -3339,8 +3522,7 @@ impl HostHeap {
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let first = offset / 4;
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3359,8 +3541,10 @@ impl HostHeap {
         }
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
-        // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        // it any more. (No reference taken when the slot holds `buffer`
+        // already: eight threads make these views into one buffer.)
+        let old = if holds { self.keep_ref_swap(index, buffer) } else { self.keep_swap(index, None) };
+        retired.extend(old);
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -6575,24 +6759,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(a.free.load(Relaxed), free + 2, "their own heap did not get the range back");
     }
 
-    /// The cursor moves on: a shard with no run that fits is passed over
-    /// for the next.
+    /// A shard with no run that fits is passed over for the next one with
+    /// room (each thread starts at a shard of its own).
     #[test]
     fn a_table_finds_a_run_in_a_later_shard() {
-        let pools = Pools::new(64);
-        let mut ends = Vec::new();
-        for _ in 0..8 {
-            ends.push(pools.take(7).unwrap());
-        }
-        assert_eq!(ends, [0, 8, 16, 24, 32, 40, 48, 56]);
-        assert_eq!(pools.free(), 8);
+        let shards = Pools::SHARDS;
+        let pools = Pools::new(shards * 8);
+        let mut ends: Vec<usize> = (0..shards).map(|_| pools.take(7).unwrap()).collect();
+        ends.sort_unstable();
+        // One run of 7 fits in each shard of 8: every shard got one.
+        assert_eq!(ends, (0..shards).map(|s| s * 8).collect::<Vec<_>>());
+        assert_eq!(pools.free(), shards as u32);
         // One slot in every shard: no two together anywhere.
         assert_eq!(pools.take(2), None);
-        // The cursor is past the first shard's one slot; each request goes
-        // to the next shard with room.
-        assert_eq!(pools.take(1), Some(15));
-        assert_eq!(pools.take(1), Some(23));
-        assert_eq!(pools.free(), 6);
+        // Each request goes to a shard with room: the last slot of the
+        // thread's shard, then of the next one.
+        let a = pools.take(1).unwrap();
+        let b = pools.take(1).unwrap();
+        assert_eq!((a % 8, b % 8), (7, 7));
+        assert_eq!(b / 8, (a / 8 + 1) % shards);
+        assert_eq!(pools.free(), shards as u32 - 2);
     }
 }
 

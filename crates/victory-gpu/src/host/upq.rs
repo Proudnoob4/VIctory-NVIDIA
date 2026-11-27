@@ -149,7 +149,23 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    let Some(mut slot) = q.free.pop().or_else(|| make_slot(&host.device)) else {
+    // Best-fit slot selection: reuse the smallest free bounce buffer that fits
+    // `total` (avoiding destroying and recreating large VRAM buffers on
+    // `victory-submit` whenever a smaller slot sits at the top of `q.free`).
+    let pick = q
+        .free
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.bounce.as_ref().is_some_and(|b| b.1 >= total))
+        .min_by_key(|(_, s)| s.bounce.as_ref().map_or(u64::MAX, |b| b.1))
+        .or_else(|| {
+            q.free
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, s)| s.bounce.as_ref().map_or(0, |b| b.1))
+        })
+        .map(|(i, _)| i);
+    let Some(mut slot) = pick.map(|i| q.free.swap_remove(i)).or_else(|| make_slot(&host.device)) else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };

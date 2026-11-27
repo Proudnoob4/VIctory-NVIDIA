@@ -1,8 +1,8 @@
 fn main() {
-    // The D3D12 Agility SDK exports (src/agility.rs): D3D12 finds them on
-    // the executable. Only the MSVC linker takes /EXPORT on a binary.
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKVersion,DATA");
-        println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKPath,DATA");
-    }
+    // D3D12 Agility SDK is loaded at runtime through
+    // `victory_shader::emit::agility::Factory` (`ID3D12SDKConfiguration1`)
+    // instead of exporting `D3D12SDKVersion`/`D3D12SDKPath` from the
+    // executable, so Windows 11 hosts without a local `D3D12\D3D12Core.dll`
+    // fall back cleanly to the system runtime instead of failing with
+    // `0x887E0003` (Marvisak/VIctory#969).
 }

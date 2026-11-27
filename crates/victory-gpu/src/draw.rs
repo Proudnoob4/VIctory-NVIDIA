@@ -512,8 +512,9 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, id, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, id, first, n);
+        if !self.dynamic.is_empty() {
+            crate::descriptor::release_dynamic_batch(&self.dynamic);
+            self.dynamic.clear();
         }
         self.fresh_tables.clear();
         self.recording = 0;
@@ -521,6 +522,88 @@ impl State {
         self.root_uav_slots.clear();
         self.tables_gone = true;
     }
+
+    /// Drains this list's dynamic descriptor ranges into `out` so an entire
+    /// landed flight can release them in a single batched pass.
+    pub(crate) fn drain_tables_into(&mut self, out: &mut Vec<(usize, u64, u32, u32)>) {
+        if self.tables_gone && self.dynamic.is_empty() {
+            return;
+        }
+        if self.tables_gone {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
+        }
+        out.extend(self.dynamic.drain(..));
+        self.fresh_tables.clear();
+        self.recording = 0;
+        self.root_srv_slots.clear();
+        self.root_uav_slots.clear();
+        self.tables_gone = true;
+    }
+}
+
+/// `VICTORY_LIST_ALIAS_EXACT=1` (default off): views of new tables known ready
+/// in the list (`make_listed`'s `ready`) are made readable again when they show
+/// an aliased texture ([`aliased_view`]).
+fn list_alias_exact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_ALIAS_EXACT").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_LIST_ALIAS_EXACT`) Ready skips refused for an aliased texture,
+/// and of them those whose readable() did something (the copy was due).
+static LIST_ALIAS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether `view` (directly or placed in memory) shows a texture read through
+/// an alias copy (`crate::texture::alias`).
+fn aliased_view(view: &View) -> bool {
+    let resource = match view {
+        View::Shader(r, _) => Some(*r),
+        View::Placed(..) => match crate::descriptor::host::placed_texture(view) {
+            Some(p) => match p.view {
+                View::Shader(r, _) => Some(r),
+                _ => None,
+            },
+            None => None,
+        },
+        _ => None,
+    };
+    resource.is_some_and(|r| crate::resource::alias_of(r as This).is_some())
+}
+
+/// The texture an aliased view shows, for the log: size, format.
+fn alias_label(view: &View) -> String {
+    let resource = match view {
+        View::Shader(r, _) => Some(*r),
+        View::Placed(..) => match crate::descriptor::host::placed_texture(view) {
+            Some(p) => match p.view {
+                View::Shader(r, _) => Some(r),
+                _ => None,
+            },
+            None => None,
+        },
+        _ => None,
+    };
+    match resource.and_then(|r| crate::resource::host_resource(r as This)) {
+        Some(t) => {
+            // SAFETY: a live resource.
+            let d = unsafe { t.GetDesc() };
+            format!("{}x{}x{} format {} levels {}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels)
+        }
+        None => "(no host texture)".into(),
+    }
+}
+
+/// For the frame lines.
+pub(crate) fn list_alias_line(frames: f64) {
+    if !list_alias_exact() {
+        return;
+    }
+    let f = frames.max(1.0);
+    let [a, b] = [0, 1].map(|i| LIST_ALIAS[i].swap(0, Ordering::Relaxed) as f64 / f);
+    tracing::info!(
+        "aliased views of new tables (VICTORY_LIST_ALIAS_EXACT=1) per frame: {a:.1} taken as ready made readable again, {b:.1} of them had their copy redone (a stale read without the switch)"
+    );
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
@@ -1525,8 +1608,33 @@ impl State {
         self.prepare_for(list, indexed, false)
     }
 
-    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches;
+    /// with `VICTORY_PLANE_NOW=1` a depth plane the draw uses before its
+    /// pass is given its twin's contents first ([`State::planes_due`]).
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let done = self.prepare_for_once(list, indexed, mesh);
+        if done && crate::host::plane_now() && self.planes_due(list) {
+            return self.prepare_for_once(list, indexed, mesh);
+        }
+        done
+    }
+
+    /// (`VICTORY_PLANE_NOW=1`) After a bind: the depth planes this draw
+    /// uses before the pass that gives them their twin's contents. The pass
+    /// is recorded now and the title's state set on the list again; true:
+    /// the caller binds anew.
+    fn planes_due(&mut self, list: &HostList) -> bool {
+        let late = list.take_plane_late();
+        if late.is_empty() {
+            return false;
+        }
+        list.planes_now(&late);
+        crate::host::PLANE_NOW_DONE.fetch_add(late.len() as u64, Ordering::Relaxed);
+        self.replay(list);
+        true
+    }
+
+    fn prepare_for_once(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -2512,9 +2620,18 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let mut room = crate::resource::room(memory);
         let sources = PASS_SOURCES.take();
         let only = sources.as_ref().is_some_and(|s| s.1);
+        let forced = only && bake_sources_forced().0;
+        let sourced_cap = bake_sources_forced().1 << 20;
+        let room_now = |mem: Option<[u64; 4]>| {
+            if forced {
+                crate::resource::within_budget(mem, sourced_cap)
+            } else {
+                crate::resource::room(mem)
+            }
+        };
+        let mut room = room_now(memory);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2974,7 +3091,7 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                room = room_now(crate::host::host().and_then(|h| h.video_memory()));
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
@@ -3076,7 +3193,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        self.march(list, p);
+        if !self.bind(list, p, true)
+            || (crate::host::plane_now() && self.planes_due(list) && !self.bind(list, p, true))
+        {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3125,16 +3245,88 @@ impl State {
         }
     }
 
+    /// Before a dispatch of `p` that reads the in-scatter marched along rays
+    /// (`crate::ambient::MARCH`), with `VICTORY_AMBIENT_MARCH` on: clamp that
+    /// image to a multiple of the room's light so open-sky transparency probes
+    /// do not veil interiors in fog (Dathinel/victory-4gb#15).
+    fn march(&mut self, list: &HostList, p: &HostPipeline) {
+        use crate::ambient::{MARCH, Role};
+        let Some(s) = p.stages.first().filter(|s| s.shader.ambient == Some(Role::March)) else {
+            return;
+        };
+        if crate::ambient::march() == 0.0 || !crate::ambient::on() {
+            return;
+        }
+        let mut any = false;
+        for (slot, offset) in MARCH {
+            let reads = s.translated().used.iter().any(|u| {
+                u.kind == ResourceType::Srv && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            });
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                continue;
+            };
+            if reads {
+                let resolved = crate::descriptor::view(table + u64::from(offset) * 4)
+                    .map(|v| crate::descriptor::host::placed_texture(&v).map_or(v, |pt| pt.view))
+                    .and_then(|v| match v {
+                        View::Shader(r, _) if r != 0 => Some(r),
+                        _ => None,
+                    });
+                if let Some(r) = resolved {
+                    any |= crate::ambient::clear_march(list, r as This);
+                }
+            }
+        }
+        if any {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+            self.sets.forget_roots(true);
+        }
+    }
+
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&mut self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_ALPHA, MISS_DEPTH, MISS_LIGHT, MISS_OPAQUE, MissNote, RADIANCE, REFLECTIONS, Role, Views};
+        if role == Role::March {
+            return false;
+        }
+        if role == Role::Miss && !crate::ambient::specular_on() {
+            return false;
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
         let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
         else {
             return false;
+        };
+        let layer = match role {
+            Role::Miss => self
+                .roots_ref(true)
+                .iter()
+                .find_map(|r| match r {
+                    Root::Constants(v) => v.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        let alpha_mode = crate::ambient::specular_alpha();
+        if role == Role::Miss
+            && !(layer == MISS_OPAQUE || (alpha_mode != crate::ambient::AlphaMode::Off && layer == MISS_ALPHA))
+        {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
+        let resolve_resource = |kind: ResourceType, v: View| -> Option<(usize, Option<[u32; 10]>)> {
+            let v = crate::descriptor::host::placed_texture(&v).map_or(v, |pt| pt.view);
+            match (kind, v) {
+                (ResourceType::Srv, View::Shader(r, d)) if r != 0 => Some((r, d)),
+                (ResourceType::Uav, View::Unordered(r, ..)) if r != 0 => Some((r, None)),
+                _ => None,
+            }
         };
         let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
             t.used.iter().find(|u| {
@@ -3143,11 +3335,8 @@ impl State {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
                 return None;
             };
-            let resource = match (kind, crate::descriptor::view(table + u64::from(offset) * 4)?) {
-                (ResourceType::Srv, View::Shader(r, _))
-                | (ResourceType::Uav, View::Unordered(r, ..)) => r,
-                _ => return None,
-            };
+            let v = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            let (resource, _) = resolve_resource(kind, v)?;
             let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
                 Some(m) => m.1,
                 None => self.user_value(true, slot, RootType::Table, 0),
@@ -3157,19 +3346,73 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            let Some(v) = crate::descriptor::view(table + u64::from(offset) * 4) else {
+                return false;
+            };
+            match resolve_resource(ResourceType::Srv, v) {
+                Some((_, Some(d))) => matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1),
+                _ => false,
+            }
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::Reflect => REFLECTIONS,
+            Role::Miss => MISS_LIGHT,
+            Role::March => return false,
         };
-        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+        let image = match role {
+            Role::Miss => entry(ResourceType::Uav, at).or_else(|| {
+                scan(ResourceType::Uav, &|d| {
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
+                })
+            }),
+            _ => entry(ResourceType::Uav, at),
+        };
+        let Some((of, image_handle)) = image else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         };
-        let depth = match role {
+        let usual_depth = |at: (u8, u32)| (!stencil_at(at)).then(|| entry(ResourceType::Srv, at)).flatten();
+        let mut miss_clamp_only = role == Role::Miss && layer == MISS_ALPHA && alpha_mode == crate::ambient::AlphaMode::Clamp;
+        let (depth, depth_size) = match role {
             Role::Resolve => {
-                let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+                let found = usual_depth(DEPTH).or_else(|| {
+                    scan(ResourceType::Srv, &|d| depth_like(d) && (d.Width, d.Height) == (of.Width, of.Height))
+                });
+                let Some((seen, dh)) = found else {
                     once!(?role, "no stand-in for the indirect light: missing depth SRV");
                     return false;
                 };
@@ -3177,25 +3420,84 @@ impl State {
                     once!(?role, "no stand-in for the indirect light: depth dimensions differ");
                     return false;
                 }
-                Some(depth)
+                (Some(dh), [seen.Width as u32, seen.Height])
             }
-            Role::Radiance | Role::Air | Role::Reflect => None,
+            Role::Miss if miss_clamp_only => {
+                (None, [of.Width as u32, of.Height])
+            }
+            Role::Miss => {
+                let depth32 = |d: &D3D12_RESOURCE_DESC| {
+                    use windows::Win32::Graphics::Dxgi::Common::{
+                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+                        DXGI_FORMAT_R32G8X24_TYPELESS,
+                    };
+                    depth_like(d)
+                        && matches!(
+                            d.Format,
+                            DXGI_FORMAT_R32_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT
+                                | DXGI_FORMAT_R32G8X24_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        )
+                };
+                let fits_2x = |d: &D3D12_RESOURCE_DESC| {
+                    depth32(d)
+                        && d.Width.abs_diff(of.Width * 2) <= 1
+                        && u64::from(d.Height).abs_diff(u64::from(of.Height) * 2) <= 1
+                };
+                let fits_1x = |d: &D3D12_RESOURCE_DESC| {
+                    depth32(d)
+                        && d.Width.abs_diff(of.Width) <= 1
+                        && u64::from(d.Height).abs_diff(u64::from(of.Height)) <= 1
+                };
+                let found = usual_depth(MISS_DEPTH)
+                    .filter(|(d, _)| fits_2x(d) || fits_1x(d))
+                    .or_else(|| scan(ResourceType::Srv, &fits_2x))
+                    .or_else(|| scan(ResourceType::Srv, &fits_1x));
+                match found {
+                    Some((seen, dh)) => (Some(dh), [seen.Width as u32, seen.Height]),
+                    None => {
+                        // Fall back to pure luminance clamp (reflect_alpha) so
+                        // opaque CS_RayMiss never passes unclamped 10-30x sky
+                        // reflections through when no D32 depth SRV is bound.
+                        once!(
+                            ?role,
+                            layer,
+                            width = of.Width,
+                            height = of.Height,
+                            "CS_RayMiss depth SRV not matched; clamping luminance without depth"
+                        );
+                        miss_clamp_only = true;
+                        (None, [of.Width as u32, of.Height])
+                    }
+                }
+            }
+            Role::Radiance | Role::Air | Role::Reflect | Role::March => (None, [of.Width as u32, of.Height]),
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
         // The pass sets the compute root signature and its arguments.
         self.sets.forget_roots(true);
-        crate::ambient::after(list, role, &Views {
-            image,
+        let ran = crate::ambient::after(list, role, &Views {
+            image: image_handle,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-        })
+            depth_size,
+            alpha_clamp: miss_clamp_only,
+        });
+        if role == Role::Miss {
+            crate::ambient::note_miss(if ran { MissNote::Ran(layer) } else { MissNote::NotReady });
+        }
+        ran
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -3653,21 +3955,34 @@ impl State {
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
+        let mut last_cap: Option<(u8, u64, &'static crate::descriptor::Heap, u32)> = None;
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
             }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
+            let (table, heap, host_count) = if let Some((s, t, h, c)) = last_cap
+                && s == u.slot
+            {
+                (t, h, c)
+            } else {
+                let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let Some(heap) = self.heap_of(table) else {
+                    continue;
+                };
+                let Some(host) = heap.host() else {
+                    continue;
+                };
+                let c = host.count();
+                last_cap = Some((u.slot, table, heap, c));
+                (table, heap, c)
             };
             let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
+            let Some(index) = heap.index(end) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
-            if index >= host.count() {
+            if index >= host_count {
                 // (A heap the host capped below the title's count: these
                 // are made afresh in the dynamic pool, which on such a
                 // heap comes out of the title's own slots.)
@@ -3706,31 +4021,31 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            let mut selected: Few<u32, 16> = Few::default();
+            for index in indexed.iter().filter(|index| index.table_slot == slot) {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+                if !selected.contains(&k) {
+                    selected.push(k);
+                }
+            }
             // The descriptors the shader moves halves through are made too,
             // and the table reaches them: they may lie past the range starts
             // the entries give (a range of several views names only its
             // first; review on #927).
-            selected.extend(
-                half.iter()
-                    .filter(|&&(s, _)| s == slot)
-                    .map(|&(_, at)| at / 8),
-            );
+            for &(_, at) in half.iter().filter(|&&(s, _)| s == slot) {
+                let k = at / 8;
+                if !selected.contains(&k) {
+                    selected.push(k);
+                }
+            }
             selected.sort_unstable();
-            selected.dedup();
             let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
@@ -3784,7 +4099,7 @@ impl State {
                         readable(list, u.kind, &view);
                     }
                 }
-                for k in selected {
+                for &k in selected.iter() {
                     if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
@@ -3857,7 +4172,37 @@ impl State {
                     let was = (listed.ready, listed.tabled);
                     if let Some(kind) = kind {
                         let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                        // (`VICTORY_LIST_ALIAS_EXACT=1`) A view of an aliased
+                        // texture is not known ready by the epoch: its copy
+                        // follows the source's writes (`crate::texture::alias`).
+                        let alias_view = (kind == ResourceType::Srv
+                            && list_alias_exact()
+                            && listed.ready.0 == list.epoch()
+                            && listed.ready.1 == tested.0)
+                            .then(|| crate::descriptor::host::listed_view(recording, words))
+                            .flatten()
+                            .filter(aliased_view);
+                        if let Some(view) = alias_view {
+                            let (epoch, steps) = (list.epoch(), list.deferred_steps());
+                            TESTED_DEPTH.set((tested.0, false));
+                            readable(list, kind, &view);
+                            let depth = TESTED_DEPTH.get().1;
+                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                            LIST_ALIAS[0].fetch_add(1, Ordering::Relaxed);
+                            if list.epoch() != epoch || list.deferred_steps() != steps {
+                                LIST_ALIAS[1].fetch_add(1, Ordering::Relaxed);
+                                listed.ready = (list.epoch(), tested.0, depth);
+                                static SAID: AtomicU64 = AtomicU64::new(0);
+                                if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
+                                    tracing::info!(
+                                        view = %alias_label(&view),
+                                        "aliased view in a new table had its copy redone (VICTORY_LIST_ALIAS_EXACT=1)"
+                                    );
+                                }
+                            } else if listed.ready.2 {
+                                TESTED_DEPTH.set((tested.0, true));
+                            }
+                        } else if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
                             if listed.ready.2 {
                                 TESTED_DEPTH.set((tested.0, true));
                             }
@@ -4484,10 +4829,16 @@ impl State {
                 (bounded, 0)
             }
         };
+        if kind == DISPATCH {
+            self.march(list, p);
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => {
+                self.bind(list, p, true)
+                    && (!(crate::host::plane_now() && self.planes_due(list)) || self.bind(list, p, true))
+            }
             _ => false,
         };
         if !ran {
@@ -4530,6 +4881,13 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

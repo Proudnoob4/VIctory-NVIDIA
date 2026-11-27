@@ -54,6 +54,33 @@ fn parts_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
 }
 
+/// Lock-free per-page-bucket write sequence filter updated on every `Shard::note`.
+/// Lets `Shadow::nothing_new_in` prove a previously verified shadow has zero
+/// new writes in `[first, last)` without acquiring `JOURNAL`, `Notes`, or `copied`.
+const WRITE_BUCKETS: usize = 4096;
+const WRITE_BUCKETS_MASK: usize = WRITE_BUCKETS - 1;
+static NOTE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_BUCKET_MAX: [std::sync::atomic::AtomicU64; WRITE_BUCKETS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; WRITE_BUCKETS];
+
+#[inline]
+pub(crate) fn note_seq() -> u64 {
+    NOTE_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[inline]
+fn buckets_clean_since(first: usize, last: usize, verified_seq: u64) -> bool {
+    if verified_seq == 0 || last <= first || last - first > 128 {
+        return false;
+    }
+    for page in first..last {
+        if WRITE_BUCKET_MAX[page & WRITE_BUCKETS_MASK].load(std::sync::atomic::Ordering::Acquire) > verified_seq {
+            return false;
+        }
+    }
+    true
+}
+
 impl Shard {
     const fn new() -> Shard {
         Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
@@ -65,6 +92,8 @@ impl Shard {
     /// A page's notes only go up: noted under the shared lock (renderer port #7),
     /// another asking with a higher number may have noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let seq = NOTE_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        WRITE_BUCKET_MAX[page & WRITE_BUCKETS_MASK].fetch_max(seq, std::sync::atomic::Ordering::Release);
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
         if parts == WHOLE || !parts_on() {
@@ -165,6 +194,16 @@ impl Notes {
                 all.sort_unstable();
                 all.into_iter().all(|(p, w)| each(p, w))
             }
+        }
+    }
+
+    fn any_in(&self, first: usize, last: usize) -> bool {
+        match pieces(first, last) {
+            Some(pieces) => pieces.into_iter().any(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.written.range(from..to).next().is_some()
+            }),
+            None => (0..SHARDS).any(|shard| self.read(shard).written.range(first..last).next().is_some()),
         }
     }
 
@@ -571,6 +610,9 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// Within the SAME known `VirtualAlloc` reservation, merge up to 32 MiB gaps
+/// to avoid dozens of separate `GetWriteWatch` syscalls per submission.
+const AHEAD_RES_GAP: usize = (32 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -584,19 +626,114 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     ask_ahead_held(ranges, false);
 }
 
+/// Cached `VirtualAlloc` reservation boundaries (`start_page -> end_page`),
+/// populated lazily ONLY when a multi-piece `GetWriteWatch` call is refused.
+/// Used purely to avoid coalescing ranges across separate reservations (never
+/// skips any individual range), so it is 100% sound and self-healing.
+static RESERVATIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn reservation_end(res: &BTreeMap<usize, usize>, page: usize) -> Option<usize> {
+    res.range(..=page).next_back().and_then(|(_, &end)| (page < end).then_some(end))
+}
+
+fn forget_reservations(first: usize, last: usize) {
+    let mut res = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if res.is_empty() {
+        return;
+    }
+    let to_remove: Vec<usize> = res
+        .range(..last)
+        .filter_map(|(&s, &e)| (e > first).then_some(s))
+        .collect();
+    for s in to_remove {
+        res.remove(&s);
+    }
+}
+
+fn learn_reservation(page: usize) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: querying our own address space.
+    let ok = unsafe {
+        VirtualQuery((page * PAGE) as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>())
+    };
+    if ok == 0 || mbi.State == MEM_FREE || mbi.RegionSize == 0 {
+        return None;
+    }
+    let alloc_base = mbi.AllocationBase as usize;
+    if alloc_base == 0 {
+        return None;
+    }
+    let mut end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+    for _ in 0..64 {
+        let mut next = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying our own address space.
+        let ok2 = unsafe {
+            VirtualQuery(end as *const _, &mut next, std::mem::size_of::<MEMORY_BASIC_INFORMATION>())
+        };
+        if ok2 == 0 || next.State == MEM_FREE || next.RegionSize == 0 || next.AllocationBase as usize != alloc_base {
+            break;
+        }
+        end = (next.BaseAddress as usize).saturating_add(next.RegionSize);
+    }
+    let start_page = alloc_base / PAGE;
+    let end_page = end / PAGE;
+    if start_page < end_page {
+        let mut res = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        res.insert(start_page, end_page);
+        Some((start_page, end_page))
+    } else {
+        None
+    }
+}
+
+/// Whether `ask_once` currently holds a submission asking in the journal.
+pub(crate) fn once_kept() -> bool {
+    journal().kept
+}
+
+/// Snapshot of the current sorted/merged `j.ahead` page ranges so parallel
+/// `refresh_front` workers can check coverage lock-free without contending on
+/// `JOURNAL.read()`.
+pub(crate) fn ahead_snapshot() -> Vec<(usize, usize)> {
+    journal().ahead.clone()
+}
+
 /// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
 fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
+    // Fast-exit BEFORE allocating/sorting `pieces` when `ask_once` already holds
+    // the submission's asking (avoids sorting 4,500 ranges 20x/frame only to drop them).
+    if !held && journal().kept {
+        return;
+    }
+    let light_on = light();
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        // Not view memory known by its bits: the kernel would refuse the
-        // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        // Not view memory known by its bits or actively guarded: the kernel
+        // would refuse the asking (and, asked together with others, theirs).
+        .filter(|r| {
+            r.0 < r.1
+                && !published(r.0, r.1)
+                && !(light_on && PROTECTED.any(r.0 / PAGE, r.1.div_ceil(PAGE)))
+        })
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     pieces.sort_unstable();
+    // Deduplicate overlapping/adjacent pieces before grouping.
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for (a, b) in pieces {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let pieces = merged;
+    if pieces.is_empty() {
+        return;
+    }
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
     if journal().kept {
@@ -608,10 +745,26 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
+        let mut res_end = {
+            let res = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+            reservation_end(&res, first)
+        };
+        // Proactively learn the reservation boundary ONCE (1 `VirtualQuery` ever per
+        // VirtualAlloc region) when the next piece lies in the 8–32 MiB merge window,
+        // so normal never-refused write-watched heaps still coalesce across 32 MiB gaps.
+        if res_end.is_none()
+            && i + 1 < pieces.len()
+            && pieces[i + 1].0 > last + AHEAD_GAP
+            && pieces[i + 1].0 <= last + AHEAD_RES_GAP
+        {
+            res_end = learn_reservation(first).map(|(_, end)| end);
+        }
+        let gap = if res_end.is_some() { AHEAD_RES_GAP } else { AHEAD_GAP };
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
+            && res_end.is_none_or(|re| pieces[k].1 <= re)
         {
             last = last.max(pieces[k].1);
             k += 1;
@@ -620,6 +773,7 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
         i = k;
     }
     note_hot(&written);
+    normalize_ahead(&mut asked);
     if port_journal() {
         let now = note_shared(&written);
         let mut j = journal_mut();
@@ -634,6 +788,32 @@ fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
+}
+
+/// Sorts and merges overlapping/adjacent page ranges in `ahead` so lookups can
+/// binary-search in O(log n) instead of linearly scanning every submission.
+fn normalize_ahead(ahead: &mut Vec<(usize, usize)>) {
+    if ahead.len() <= 1 {
+        return;
+    }
+    ahead.sort_unstable();
+    let mut w = 0usize;
+    for r in 1..ahead.len() {
+        let (a, b) = ahead[r];
+        if a <= ahead[w].1 {
+            ahead[w].1 = ahead[w].1.max(b);
+        } else {
+            w += 1;
+            ahead[w] = (a, b);
+        }
+    }
+    ahead.truncate(w + 1);
+}
+
+#[inline]
+fn ahead_contains(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let idx = ahead.partition_point(|&(a, _)| a <= first);
+    idx > 0 && ahead[idx - 1].1 >= last
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -1022,6 +1202,7 @@ fn ask_once_quiet(ranges: &[(usize, usize)], frame: u64, keep: u64) {
         }
     }
     note_hot(&found);
+    normalize_ahead(&mut ahead);
     if port_journal() {
         let now = note_shared(&found);
         let mut j = journal_mut();
@@ -1074,20 +1255,28 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let light_on = light();
     let mut written = Vec::new();
+    let mut extra: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if light_on && PROTECTED.any(first, last) {
+            continue;
+        }
+        if !ahead_contains(&ahead, first, last)
+            && !extra.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            extra.push((first, last));
         }
     }
+    ahead.extend(extra);
     note_hot(&written);
+    normalize_ahead(&mut ahead);
     if port_journal() {
         let now = note_shared(&written);
         let mut j = journal_mut();
@@ -1165,7 +1354,7 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
 /// write-watched does. A piece alone is left to [`writes`]. Adds what was
 /// asked to `asked` and the pages found written to `written`.
 fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
-    if pieces.len() < 2 {
+    if pieces.is_empty() {
         return;
     }
     let first = pieces[0].0;
@@ -1175,7 +1364,19 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
         asked.push((first, last));
         return;
     }
-    let (a, b) = pieces.split_at(pieces.len() / 2);
+    if pieces.len() < 2 {
+        return;
+    }
+    // Evict any stale reservation covering `[first, last)` and learn exact
+    // boundaries so future submissions never merge across these reservations.
+    forget_reservations(first, last);
+    let learned_first = learn_reservation(first);
+    let _ = learn_reservation(pieces[pieces.len() - 1].0);
+    let split = learned_first
+        .map(|(_, res_end)| pieces.partition_point(|p| p.1 <= res_end))
+        .filter(|&mid| mid > 0 && mid < pieces.len())
+        .unwrap_or(pieces.len() / 2);
+    let (a, b) = pieces.split_at(split);
     ask_run(a, asked, written);
     ask_run(b, asked, written);
 }
@@ -1188,10 +1389,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.notes.range(first, last)))
+    ahead_contains(&j.ahead, first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1203,10 +1401,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| {
-        j.ahead
-            .iter()
-            .any(|&(a, b)| a <= first && last <= b)
-            .then(|| (j.ahead_asked, j.notes.range(first, last)))
+        ahead_contains(&j.ahead, first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
     };
     let fresh = || {
         let j = journal();
@@ -1225,6 +1420,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         return Some(fresh());
     }
+    // View memory known to be guarded/published cannot be write-watched:
+    // skip `Asking::hold` and a guaranteed-refused `GetWriteWatch` syscall
+    // when the caller only asks for write-watched memory (`guarded == false`,
+    // e.g. `Staging::refresh_timed` checking view-backed textures ~157x/frame).
+    if !guarded && light() && (published(start, end) || PROTECTED.any(first, last)) {
+        return None;
+    }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
@@ -1234,7 +1436,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ASKED_HERE.with(|c| c.set(c.get() + 1));
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
-    let refused = guarded && light() && PROTECTED.any(first, last);
+    let refused = light() && PROTECTED.any(first, last);
     let pages = match if refused { None } else { kernel_written(first, last) } {
         Some(pages) => pages,
         None => {
@@ -1348,7 +1550,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_contains(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -1356,6 +1558,70 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     };
     (ranged != 0 || all_copied)
         && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+}
+
+/// Lock-free fast path for [`nothing_new`]: checks `published` / `ahead`
+/// (without locking `JOURNAL` when `ahead_snap` is provided) and the
+/// 4096-bucket `WRITE_BUCKET_MAX` sequence filter against `verified_seq`:
+/// - `Some(true)`: covered and guaranteed zero new `Shard::note` writes since `verified_seq`.
+/// - `Some(false)`: not covered by `published` or `ahead` (caller must ask).
+/// - `None`: covered, but either unverified (`verified_seq == 0`) or a bucket
+///   has a note `> verified_seq` (caller must fall back to full `nothing_new`).
+pub(crate) fn nothing_new_fast_in(
+    start: usize,
+    end: usize,
+    verified_seq: u64,
+    ahead_snap: Option<&[(usize, usize)]>,
+) -> Option<bool> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    if !known {
+        let covered = match ahead_snap {
+            Some(a) => ahead_contains(a, first, last),
+            None => ahead_contains(&journal().ahead, first, last),
+        };
+        if !covered {
+            return Some(false);
+        }
+    }
+    if verified_seq > 0 && buckets_clean_since(first, last, verified_seq) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Lock-free check for [`nothing_new`] when the caller already knows every page
+/// in `[start, end)` has been copied at least once (`all_copied == true`):
+/// - `Some(true)`: covered by published/ahead and zero writes exist in `[first, last)`.
+/// - `Some(false)`: not covered by published/ahead (caller must ask the kernel).
+/// - `None`: covered, but at least one write note exists in `[first, last)` so the
+///   caller must compare against its per-page `copied` timestamps.
+pub(crate) fn nothing_new_clean(start: usize, end: usize) -> Option<bool> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    let j = journal();
+    if !known && !ahead_contains(&j.ahead, first, last) {
+        return Some(false);
+    }
+    if !j.notes.any_in(first, last) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Whether any block in `[at, at + len)` is mapped at another title address too.
+pub(crate) fn has_aliases(at: usize, len: usize) -> bool {
+    !elsewhere(at, len).is_empty()
 }
 
 impl Tracked {
@@ -3366,6 +3632,9 @@ pub(crate) mod fine {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len != 0 {
+        forget_reservations(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    }
     crate::shadow::lazy_flush_range(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
@@ -3377,6 +3646,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    if len != 0 {
+        forget_reservations(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    }
     if CHANGING.get().0 && len != 0 {
         let guard = crate::shadow::lazy_begin_remapping(at, len);
         LAZY_REMAP_GUARDS.with_borrow_mut(|v| v.push(guard));
@@ -3520,18 +3792,6 @@ pub(crate) fn install() {
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
-        // Lazy GPU-resident demand flush first (with zero `watch` locks held;
-        // lock-free atomic fast path when no deferred pages are armed). Must
-        // run before `safecopy` failure redirect so safe copies materialize
-        // lazy pages instead of treating `PAGE_NOACCESS` as unmapped.
-        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS && r.NumberParameters >= 2 {
-            let access = r.ExceptionInformation[0];
-            if (access == READ || access == WRITE)
-                && crate::shadow::lazy_on_fault(r.ExceptionInformation[1], access == WRITE)
-            {
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-        }
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
@@ -3542,70 +3802,103 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return match ours {
                 Some(exit) => fail(exit),
-                None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-                    && r.NumberParameters >= 2
-                    && r.ExceptionInformation[0] == READ
-                    && came_back(r.ExceptionInformation[1], false) =>
-                {
-                    EXCEPTION_CONTINUE_EXECUTION
-                }
                 None => EXCEPTION_CONTINUE_SEARCH,
             };
         }
+        let access = r.ExceptionInformation[0];
         let at = r.ExceptionInformation[1];
-        let block = at / BLOCK;
-        if ours.is_none()
-            && PROTECTED.any(block, block + 1)
-            // SAFETY: the context the system passes, to go on from.
-            && crate::titlewrite::store(unsafe { &mut *context }, at)
-        {
-            return EXCEPTION_CONTINUE_EXECUTION;
+        if access != READ && access != WRITE {
+            return match ours {
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
         }
-        // Another thread may have opened the block since this one faulted
-        // (then nothing waits for the lock), and a copy may have guarded it
-        // again since that (then it is ours again, not read-only for some
-        // other reason).
-        for _ in 0..3 {
-            if !PROTECTED.any(block, block + 1) && writable(at) {
-                #[cfg(feature = "diagnostics")]
-                crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
+        let is_write = access == WRITE;
+        const MAX_EPOCH_RETRIES: u32 = 32;
+        let mut epoch_retries = 0u32;
+        loop {
+            let epoch_before = crate::shadow::lazy_table_epoch();
+            // Lazy GPU-resident demand flush first (with zero `watch` locks held;
+            // lock-free atomic fast path when no deferred pages are armed). Must
+            // run before `safecopy` failure redirect so safe copies materialize
+            // lazy pages instead of treating `PAGE_NOACCESS` as unmapped.
+            if crate::shadow::lazy_on_fault(at, is_write) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-            #[cfg(feature = "diagnostics")]
-            let began = std::time::Instant::now();
-            // (Let go again before the next look: the runtime wants the
-            // guards to end a change.)
-            let mut g = guards();
-            #[cfg(feature = "diagnostics")]
-            let waited = began.elapsed();
-            let opened = open(&mut g, at, at + 1);
-            if opened != 0 {
-                g.opened(block);
-                drop(g);
-                #[cfg(feature = "diagnostics")]
+            if !is_write {
+                if epoch_retries < MAX_EPOCH_RETRIES
+                    && crate::shadow::lazy_table_epoch() != epoch_before
+                    && committed_protect(at).is_some()
                 {
-                    crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-                    let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
-                    let held = (began.elapsed() - waited).as_nanos() as u64;
-                    crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
-                    crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
+                    epoch_retries += 1;
+                    continue;
                 }
+                return match ours {
+                    Some(exit) => fail(exit),
+                    None if came_back(at, false) => EXCEPTION_CONTINUE_EXECUTION,
+                    None => EXCEPTION_CONTINUE_SEARCH,
+                };
+            }
+            let block = at / BLOCK;
+            if ours.is_none()
+                && PROTECTED.any(block, block + 1)
+                // SAFETY: the context the system passes, to go on from.
+                && crate::titlewrite::store(unsafe { &mut *context }, at)
+            {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
-        }
-        if writable(at) {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        match ours {
-            Some(exit) => fail(exit),
-            None if came_back(at, true) => EXCEPTION_CONTINUE_EXECUTION,
-            None => EXCEPTION_CONTINUE_SEARCH,
+            // Another thread may have opened the block since this one faulted
+            // (then nothing waits for the lock), and a copy may have guarded it
+            // again since that (then it is ours again, not read-only for some
+            // other reason).
+            for _ in 0..3 {
+                if !PROTECTED.any(block, block + 1) && writable(at) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                #[cfg(feature = "diagnostics")]
+                let began = std::time::Instant::now();
+                // (Let go again before the next look: the runtime wants the
+                // guards to end a change.)
+                let mut g = guards();
+                #[cfg(feature = "diagnostics")]
+                let waited = began.elapsed();
+                let opened = open(&mut g, at, at + 1);
+                if opened != 0 {
+                    g.opened(block);
+                    drop(g);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                        let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
+                        let held = (began.elapsed() - waited).as_nanos() as u64;
+                        crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
+                        crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+            if writable(at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            // Retry if a concurrent lazy flush/re-arm modified `LAZY_TABLE` while
+            // we checked `GUARDS` (without holding `GUARDS` across `lazy_on_fault`).
+            if epoch_retries < MAX_EPOCH_RETRIES
+                && crate::shadow::lazy_table_epoch() != epoch_before
+                && committed_protect(at).is_some()
+            {
+                epoch_retries += 1;
+                continue;
+            }
+            return match ours {
+                Some(exit) => fail(exit),
+                None if came_back(at, true) => EXCEPTION_CONTINUE_EXECUTION,
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -3615,16 +3908,24 @@ pub(crate) fn install() {
     });
 }
 
-/// Whether `at` is committed read-write memory now.
-fn writable(at: usize) -> bool {
+/// Protection flags if `at` is currently committed memory, else `None`.
+fn committed_protect(at: usize) -> Option<u32> {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    (n != 0 && info.State == MEM_COMMIT).then_some(info.Protect)
+}
+
+/// Whether `at` is committed read-write memory now.
+fn writable(at: usize) -> bool {
+    matches!(
+        committed_protect(at),
+        Some(windows_sys::Win32::System::Memory::PAGE_READWRITE)
+    )
 }
 
 #[cfg(test)]

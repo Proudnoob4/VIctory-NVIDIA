@@ -155,6 +155,29 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     )
 }
 
+/// Hybrid sleep + final 1.5 ms busy-spin for jitter-free frame pacing
+/// (`VICTORY_PRECISE_PACE=0`: plain `thread::sleep`). With `timeBeginPeriod(1)`
+/// already active, sleeping to `deadline - 1.5 ms` and spinning the tail yields
+/// a flat 33.333 ms frametime line for 30 fps logic and Smooth Motion 60 fps.
+fn sleep_precise(wait: Duration) {
+    if wait.is_zero() {
+        return;
+    }
+    static PRECISE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*PRECISE.get_or_init(|| std::env::var_os("VICTORY_PRECISE_PACE").is_none_or(|v| v != "0")) {
+        std::thread::sleep(wait);
+        return;
+    }
+    let deadline = Instant::now() + wait;
+    const SPIN_TAIL: Duration = Duration::from_micros(1_500);
+    if let Some(coarse) = wait.checked_sub(SPIN_TAIL) {
+        std::thread::sleep(coarse);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
 /// Device method: blocks until the next tick (or the time-out); an origin
 /// wait then hands out the new frame's token. Other events keep the token
 /// the title passes. Ticks are absolute (start plus whole intervals), so
@@ -189,7 +212,7 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        sleep_precise(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };

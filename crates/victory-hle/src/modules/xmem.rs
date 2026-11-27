@@ -459,7 +459,41 @@ impl Section {
     }
 }
 
+/// `VICTORY_KEEP_PAGES=1` (fxceless#1294): keeps physical section pages in our
+/// working set through `Section::window` so Windows does not flush unmapped
+/// dirty pages to the pagefile behind the title during streaming remaps.
+fn keeping() -> bool {
+    static KEEP: LazyLock<bool> = LazyLock::new(|| {
+        !on_wine() && std::env::var("VICTORY_KEEP_PAGES").is_ok_and(|v| v.trim() == "1")
+    });
+    *KEEP
+}
+
 impl Section {
+    /// Reads each committed 4 KiB page of `index..index+n` once through this
+    /// section's persistent `window` view when `VICTORY_KEEP_PAGES=1`, keeping
+    /// those pages in our working set when the title unmaps its view.
+    fn keep_pages(&self, index: usize, n: usize) {
+        if !keeping() || n == 0 || index >= self.pages {
+            return;
+        }
+        let count = n.min(self.pages - index);
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let base = *self.window.get_or_init(|| {
+            // SAFETY: the whole of a section we own; reserved pages stay
+            // uncommitted until a view commits them.
+            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+        });
+        if base == 0 {
+            return;
+        }
+        let start = base + index * PAGE;
+        for at in (start..start + count * PAGE).step_by(4096) {
+            // SAFETY: inside the persistent section view, at a committed page.
+            unsafe { std::ptr::read_volatile(at as *const u8) };
+        }
+    }
+
     /// Commits the pages from `index` on that a view at `base` shows, unless
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
@@ -789,6 +823,7 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
+        slice.section.keep_pages(slice.index, n);
         Some(view)
     }
 
@@ -1714,6 +1749,7 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    slice.section.keep_pages(slice.index, len.div_ceil(PAGE));
     true
 }
 

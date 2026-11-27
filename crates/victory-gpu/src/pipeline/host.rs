@@ -676,6 +676,9 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Not taken from the library with static samplers
+        // (`library::with_static_samplers`).
+        let _samplers = super::library::with_static_samplers(!samplers.is_empty());
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -1124,7 +1127,12 @@ fn root_signature(
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+        if let Err(e) = victory_shader::emit::agility::serialize_versioned_root_signature(
+            device,
+            &desc,
+            &mut blob,
+            Some(&mut error),
+        ) {
             if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),

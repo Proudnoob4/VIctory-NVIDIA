@@ -822,6 +822,51 @@ pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     }
 }
 
+/// Gives back many `(heap, id, first, n)` dynamic slot ranges under one
+/// `SHADER_HEAPS` read lock and one batched pool release per `(heap, id)`.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(items: &[(usize, u64, u32, u32)]) {
+    if items.is_empty() {
+        return;
+    }
+    if items.len() == 1 {
+        let (heap, id, first, n) = items[0];
+        release_dynamic(heap, id, first, n);
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // Fast path: almost every list/flight uses a single shader-visible view heap.
+    let (h0, id0, _, _) = items[0];
+    if items.iter().all(|&(h, id, _, _)| h == h0 && id == id0) {
+        if heaps.iter().any(|&(_, _, h)| h == h0)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(h0 as *const Heap) }.host.get()
+        {
+            let ranges: Vec<(u32, u32)> = items.iter().map(|&(_, _, f, n)| (f, n)).collect();
+            host.release_batch(id0, &ranges);
+        }
+        return;
+    }
+    let mut sorted: Vec<(usize, u64, u32, u32)> = items.to_vec();
+    sorted.sort_unstable_by_key(|&(h, id, f, _)| (h, id, f));
+    let mut i = 0;
+    while i < sorted.len() {
+        let (heap, id, _, _) = sorted[i];
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j].0 == heap && sorted[j].1 == id {
+            j += 1;
+        }
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            let ranges: Vec<(u32, u32)> = sorted[i..j].iter().map(|&(_, _, f, n)| (f, n)).collect();
+            host.release_batch(id, &ranges);
+        }
+        i = j;
+    }
+}
+
 /// Runs `f` with the host heap of the title's largest view heap, if there is
 /// one (nothing is waited for).
 #[cfg(windows)]
@@ -837,23 +882,42 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
     Some(f(host))
 }
 
-/// Makes dynamic slot `index` of the host heap behind the title heap at
-/// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes of `buffer` at `gpu`.
+/// Makes many dynamic slots `(title_heap, index, offset, size)` constant buffer
+/// views into `buffer` (whose GPU virtual address is `base_gpu`) under a single
+/// `SHADER_HEAPS` read lock.
 #[cfg(windows)]
-pub(crate) fn constant_slot(
-    heap: usize,
-    index: u32,
+pub(crate) fn constant_slots_batch(
     buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    gpu: u64,
-    size: u32,
+    base_gpu: u64,
+    slots: &[(usize, u32, u64, u32)],
 ) {
+    if slots.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.constant_at(index, buffer, gpu, size);
+    let mut cached: Option<(usize, Option<&host::HostHeap>)> = None;
+    let mut retired: Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = Vec::new();
+    for &(heap, index, offset, size) in slots {
+        let host = match cached {
+            Some((h, host)) if h == heap => host,
+            _ => {
+                let resolved = if heaps.iter().any(|&(_, _, h)| h == heap) {
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    unsafe { &*(heap as *const Heap) }.host.get().and_then(|h| h.as_ref())
+                } else {
+                    None
+                };
+                cached = Some((heap, resolved));
+                resolved
+            }
+        };
+        if let Some(host) = host {
+            host.constant_at_offset_batched(index, buffer, base_gpu, offset, size, &mut retired);
+        }
+    }
+    drop(heaps);
+    if !retired.is_empty() {
+        crate::host::retire_resources_batch(retired);
     }
 }
 

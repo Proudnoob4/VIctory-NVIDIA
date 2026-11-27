@@ -255,6 +255,74 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Whether the pipeline this thread makes has static samplers
+    /// ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pipelines this thread makes while the guard lives have static
+/// samplers (`samplers`). With `VICTORY_SAMPLERS_MADE=1` (default off) they
+/// are made every run, never loaded from or stored in the library.
+///
+/// The driver keeps static samplers in a table of its own and compiles
+/// their places in it into the pipeline. A pipeline loaded from the library
+/// keeps the places of the process that stored it; where that process made
+/// its static samplers in another order, they are other samplers here
+/// (other filters, address modes, levels, comparisons), so which pipelines
+/// look wrong differs from run to run. Measured with a stand-alone probe on
+/// an RTX 4070 SUPER (readmet3xt-lab/foxhound 7fa0e95, by way of
+/// Op-lite/victory-scarlett): the colour grading's composite pipeline,
+/// loaded, read its tables unfiltered (bands in the light); made in the
+/// run, smooth.
+/// Off by default: on the RTX 4080 / i5-13600K it made 1,363 pipelines a
+/// run that the library had loaded, on the six lowest-priority pipeline
+/// workers of a CPU the title keeps busy: 776 were still being made at world
+/// entry and 253 four and a half minutes later, and the play ran at 27.3
+/// fps against 35.6 (pass 45 against pass 42, the same route).
+pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(samplers))
+}
+
+/// See [`with_static_samplers`]; the setting before it comes back on drop.
+pub(crate) struct StaticSamplers(bool);
+
+impl Drop for StaticSamplers {
+    fn drop(&mut self) {
+        STATIC_SAMPLERS.set(self.0);
+    }
+}
+
+/// `VICTORY_SAMPLERS_MADE=1`: see [`with_static_samplers`].
+fn samplers_made() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLERS_MADE").is_some_and(|v| v == "1"))
+}
+
+/// Pipelines with static samplers since the start: loaded from the library
+/// (each may read through other samplers than its own), made, made because
+/// of [`samplers_made`].
+static WITH_SAMPLERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Counts a pipeline with static samplers (`kind`, as in [`WITH_SAMPLERS`])
+/// and says the counts at most every 10 s.
+fn count_samplers(kind: usize) {
+    WITH_SAMPLERS[kind].fetch_add(1, Ordering::Relaxed);
+    static SAID_MS: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let said = SAID_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(said) < 10_000
+        || SAID_MS.compare_exchange(said, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let v: [u64; 3] = std::array::from_fn(|i| WITH_SAMPLERS[i].load(Ordering::Relaxed));
+    tracing::info!(
+        "pipelines with static samplers since the start (VICTORY_SAMPLERS_MADE={}): {} loaded from the library (may sample through another run's samplers), {} made, of them {} kept out of the library",
+        u8::from(samplers_made()),
+        v[0],
+        v[1] + v[2],
+        v[2],
+    );
 }
 
 /// Names the pipeline this thread makes next.
@@ -520,8 +588,12 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let samplers = STATIC_SAMPLERS.get();
+    let Some(library) = library().filter(|_| !(samplers && samplers_made())) else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        if samplers {
+            count_samplers(if samplers_made() { 2 } else { 1 });
+        }
         return create();
     };
     let began = std::time::Instant::now();
@@ -537,6 +609,9 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            if samplers {
+                count_samplers(0);
+            }
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -551,6 +626,9 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    if samplers {
+        count_samplers(1);
+    }
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(

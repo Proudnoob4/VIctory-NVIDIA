@@ -21,6 +21,7 @@ clap.workspace = true
 walkdir.workspace = true
 
 [features]
+default = ["mimalloc"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [
@@ -29,6 +30,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Rust allocations through mimalloc instead of the shared process heap.
+mimalloc = ["victory-hle/mimalloc"]
 
 [lints]
 workspace = true

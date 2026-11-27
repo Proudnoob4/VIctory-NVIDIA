@@ -42,7 +42,20 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// 85 % of its DXGI budget ([`crate::host::keep_freed`]), clamped to
 /// `SPARE..=SPARE_KEPT`. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let mut cap = spares(memory, crate::host::keep_freed());
+    // Every 64 MiB D3D12 texture heap commits 64 MiB in Windows WDDM private
+    // commit. Under RAM pressure, avoid hoarding up to 4 GiB of empty blocks.
+    if let Some(avail) = crate::host::available_physical_ram() {
+        let ram_cap = if avail < 4 << 30 {
+            SPARE
+        } else if avail < 8 << 30 {
+            6
+        } else {
+            SPARE_KEPT
+        };
+        cap = cap.min(ram_cap);
+    }
+    SPARES.store(cap, Ordering::Relaxed);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
