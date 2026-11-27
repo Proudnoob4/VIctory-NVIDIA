@@ -176,7 +176,7 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
         let Some(jmp) = jump(at, stub) else {
             return false;
         };
-        patch(at, [a, b, c, d, e], jmp)
+        patch_slice(at, &[a, b, c, d, e], &jmp, code)
     }
 }
 
@@ -272,7 +272,7 @@ unsafe fn patch_sse4a(at: usize, code: &[u8], what: ConsoleOnly) -> bool {
         };
         let mut repl = vec![0x90u8; code.len()];
         repl[..5].copy_from_slice(&jmp);
-        patch_slice(at, code, &repl)
+        patch_slice(at, code, &repl, code)
     }
 }
 
@@ -289,23 +289,78 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
     Some(u128::from_le_bytes(bytes))
 }
 
-/// One thread at a time changes code: a second one would take the first one's loosened
-/// protection for the page's own.
-static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A replacement we actually published, and the entire instruction it replaced. A clzero
+/// loop replaces only its first five bytes, but a delayed fault must emulate all twelve.
+struct PatchedInstruction {
+    at: usize,
+    before: Vec<u8>,
+    after: Vec<u8>,
+}
+
+/// One thread at a time reads or changes patchable code: a second writer would take the
+/// first one's loosened protection for the page's own. The original instruction is recorded
+/// before releasing this lock, so a fault delivered after another thread patched the site
+/// can still be emulated. Only an exact recorded replacement is recognized.
+static PATCHING: std::sync::Mutex<Vec<PatchedInstruction>> = std::sync::Mutex::new(Vec::new());
+
+/// Snapshots readable instruction bytes while no patch is being installed. When another
+/// thread already replaced this instruction, returns its original bytes for this queued
+/// fault. Emulating them advances RIP, rather than retrying an arbitrary jump indefinitely.
+///
+/// # Safety
+/// `n <= 16` bytes at `at` are readable title code which stays mapped.
+unsafe fn fault_code(at: usize, n: usize) -> ([u8; 16], usize, bool) {
+    let patches = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut bytes = [0u8; 16];
+    // SAFETY: the caller checked readability; our patch writers hold the same lock.
+    unsafe { std::ptr::copy_nonoverlapping(at as *const u8, bytes.as_mut_ptr(), n) };
+    if let Some(patch) = patches
+        .iter()
+        .find(|p| p.at == at && bytes[..n].get(..p.after.len()) == Some(p.after.as_slice()))
+    {
+        bytes[..patch.before.len()].copy_from_slice(&patch.before);
+        return (bytes, patch.before.len(), true);
+    }
+    (bytes, n, false)
+}
 
 /// Replaces `was` at `at` with `replacement` in one atomic `cmpxchg16b` store.
 ///
 /// # Safety
-/// `at` is in code that stays mapped, and `replacement` preserves semantics.
-unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
+/// `instruction.len()` bytes at `at` are readable code that stays mapped, and
+/// `replacement` preserves the semantics of the original `instruction`.
+unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8], instruction: &[u8]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if was.len() != replacement.len() || (at & 15) + replacement.len() > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
+    if was.is_empty()
+        || was.len() != replacement.len()
+        || instruction.len() > 16
+        || !instruction.starts_with(was)
+        || !decode::decode(instruction)
+            .is_some_and(|(what, n)| n == instruction.len() && what != ConsoleOnly::Ud2)
+        || (at & 15) + replacement.len() > 16
+        || !std::is_x86_feature_detected!("cmpxchg16b")
+    {
         return false;
     }
-    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut patches = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut after = instruction.to_vec();
+    after[..replacement.len()].copy_from_slice(replacement);
+    let mut current = [0u8; 16];
+    // SAFETY: the caller supplies the whole readable original instruction, which stays mapped.
+    unsafe {
+        std::ptr::copy_nonoverlapping(at as *const u8, current.as_mut_ptr(), instruction.len())
+    };
+    if current[..instruction.len()] == after {
+        return patches
+            .iter()
+            .any(|p| p.at == at && p.before == instruction && p.after == after);
+    }
+    if &current[..instruction.len()] != instruction {
+        return false;
+    }
     let word = (at & !15) as *mut u128;
     let here = (at & 15)..(at & 15) + replacement.len();
     let mut old = 0u32;
@@ -319,11 +374,10 @@ unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
         let mut now = std::arch::x86_64::cmpxchg16b(word, 0, 0, SeqCst, SeqCst);
         let done = loop {
             let bytes = &now.to_le_bytes()[here.clone()];
-            if bytes == replacement {
-                // (Another thread's fault at the same place: done already.)
-                break true;
-            }
-            let Some(new) = (bytes == was).then(|| with_patch(now, at, replacement)).flatten() else {
+            let Some(new) = (bytes == was)
+                .then(|| with_patch(now, at, replacement))
+                .flatten()
+            else {
                 break false;
             };
             let there = std::arch::x86_64::cmpxchg16b(word, now, new, SeqCst, SeqCst);
@@ -334,6 +388,14 @@ unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
         };
         VirtualProtect(word.cast(), 16, old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), word.cast(), 16);
+        if done {
+            patches.retain(|p| p.at != at);
+            patches.push(PatchedInstruction {
+                at,
+                before: instruction.to_vec(),
+                after,
+            });
+        }
         done
     }
 }
@@ -346,7 +408,7 @@ unsafe fn patch_slice(at: usize, was: &[u8], replacement: &[u8]) -> bool {
 /// `at` is in code that stays mapped, and `patch` does for it what `was` does.
 unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
     // SAFETY: forwarded from caller's contract.
-    unsafe { patch_slice(at, &was, &patch) }
+    unsafe { patch_slice(at, &was, &patch, &was) }
 }
 
 /// Diagnostics: how often each place in the title's code raises one of these exceptions, the
@@ -504,8 +566,10 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             n
         }
     };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
+    // SAFETY: `n` bytes at `rip` are readable. Copy under the patch lock: another faulting
+    // thread may replace these bytes before this thread's exception is dispatched.
+    let (bytes, n, patched) = unsafe { fault_code(rip, n) };
+    let code = &bytes[..n];
     let Some((what, len)) = decode::decode(code) else { return 0 };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
@@ -524,20 +588,15 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
             // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
-                }
+            if !patched {
+                // SAFETY: the original instruction's bytes are replaced by no-ops atomically.
+                unsafe { patch_slice(rip, &code[..len], &[0x90; 16][..len], &code[..len]) };
             }
         }
         ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
             // Without a prefix, so 3 bytes: replaced, the next pass does not fault.
-            if len == 3
+            if !patched
+                && len == 3
                 && patches_waits()
                 && let Some(new) = wait_patch(what)
                 // SAFETY: the title's code, where the instruction just faulted; both
@@ -562,7 +621,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
             // (and not again: the next time it is plain stores)
-            if len == 12
+            if !patched
+                && len == 12
                 && patches_clzero()
                 // SAFETY: the title's code, where the loop's first instruction just faulted.
                 && unsafe { patch_clzero(rip, &code[..12]) }
@@ -626,7 +686,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
         // the low quadword changes; the high one is zeroed, as a Zen 5 does
         ConsoleOnly::Extrq { dst, src, len: flen, idx } => {
-            if src.is_none()
+            if !patched
+                && src.is_none()
                 && len >= 5
                 && patches_sse4a()
                 // SAFETY: `rip` is mapped title code of `len` bytes.
@@ -649,7 +710,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             d.High = 0;
         }
         ConsoleOnly::Insertq { dst, src, reg, len: flen, idx } => {
-            if !reg
+            if !patched
+                && !reg
                 && len >= 5
                 && patches_sse4a()
                 // SAFETY: `rip` is mapped title code of `len` bytes.
@@ -684,6 +746,217 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The faults have already happened on all threads when the first thread publishes the
+    /// native replacement. Dispatching those queued faults must still perform each thread's
+    /// original operation, exactly once, without trying to decode the replacement jump.
+    #[test]
+    fn queued_sse4a_faults_emulate_the_original_after_another_thread_patches() {
+        use std::sync::Barrier;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let cases: &[&[u8]] = &[
+            &[0xf2, 0x44, 0x0f, 0x78, 0xcf, 0x08, 0x00], // actual fault: insertq xmm9,xmm7,8,0
+            &[0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10],       // insertq xmm0,xmm1,16,16
+            &[0x66, 0x0f, 0x78, 0xc0, 0x08, 0x10],       // extrq xmm0,8,16
+        ];
+        // SAFETY: our page stays allocated until every simulated exception has returned.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as usize;
+            assert_ne!(page, 0);
+            for (case, &insn) in cases.iter().enumerate() {
+                let at = page + 32 + case * 64;
+                std::ptr::copy_nonoverlapping(insn.as_ptr(), at as *mut u8, insn.len());
+                let (what, len) = decode::decode(insn).unwrap();
+                let (dst_reg, src_reg) = match what {
+                    ConsoleOnly::Insertq { dst, src, .. } => (usize::from(dst), usize::from(src)),
+                    ConsoleOnly::Extrq { dst, .. } => (usize::from(dst), 1),
+                    _ => unreachable!(),
+                };
+                let queued = Barrier::new(9);
+                let published = Barrier::new(9);
+                std::thread::scope(|scope| {
+                    for thread in 0..8u64 {
+                        let (queued, published) = (&queued, &published);
+                        scope.spawn(move || {
+                            let mut context: CONTEXT = std::mem::zeroed();
+                            context.Rip = at as u64;
+                            context.Rax = 0x1234;
+                            context.EFlags = 0x246;
+                            let dst = 0x1122_3344_5566_7788 ^ (thread << 16);
+                            let src = 0xabcd_0000 + thread;
+                            context.Anonymous.FltSave.XmmRegisters[dst_reg].Low = dst;
+                            context.Anonymous.FltSave.XmmRegisters[dst_reg].High = -1;
+                            context.Anonymous.FltSave.XmmRegisters[src_reg].Low = src;
+                            queued.wait();
+                            published.wait();
+                            assert_eq!(
+                                emulate(&mut context),
+                                CONTINUE_EXECUTION,
+                                "queued case {case}, thread {thread}"
+                            );
+                            let want = match what {
+                                ConsoleOnly::Insertq { len, idx, .. } => {
+                                    decode::insertq(dst, src, len, idx)
+                                }
+                                ConsoleOnly::Extrq { len, idx, .. } => decode::extrq(dst, len, idx),
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(context.Rip, at as u64 + len as u64);
+                            assert_eq!((context.Rax, context.EFlags), (0x1234, 0x246));
+                            assert_eq!(context.Anonymous.FltSave.XmmRegisters[dst_reg].Low, want);
+                            assert_eq!(context.Anonymous.FltSave.XmmRegisters[dst_reg].High, 0);
+                            assert_eq!(context.Anonymous.FltSave.XmmRegisters[src_reg].Low, src);
+                        });
+                    }
+                    queued.wait();
+                    let installed = patch_sse4a(at, insn, what);
+                    published.wait();
+                    assert!(installed);
+                });
+            }
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn unknown_or_modified_replacement_jumps_are_not_emulated() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: reads and writes stay inside our page; none of its jump bytes are executed.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as usize;
+            assert_ne!(page, 0);
+            let insn = [0xf2, 0x0f, 0x78, 0xc1, 0x10, 0x10];
+            let at = page + 32;
+            std::ptr::copy_nonoverlapping(insn.as_ptr(), at as *mut u8, insn.len());
+            assert!(patch_sse4a(at, &insn, decode::decode(&insn).unwrap().0));
+            let mut replacement = [0u8; 6];
+            std::ptr::copy_nonoverlapping(
+                at as *const u8,
+                replacement.as_mut_ptr(),
+                replacement.len(),
+            );
+            let unknown = page + 96;
+            std::ptr::copy_nonoverlapping(
+                replacement.as_ptr(),
+                unknown as *mut u8,
+                replacement.len(),
+            );
+            assert!(
+                !fault_code(at, 5).2,
+                "an incomplete replacement is not an exact match"
+            );
+            for rip in [unknown, at] {
+                if rip == at {
+                    *((at + 1) as *mut u8) ^= 1;
+                }
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = rip as u64;
+                context.Rax = 0x1234;
+                assert_eq!(emulate(&mut context), 0);
+                assert_eq!((context.Rip, context.Rax), (rip as u64, 0x1234));
+            }
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn queued_wait_and_clwb_faults_keep_the_original_instruction_length() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: only our allocated code page and simulated context are touched.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as usize;
+            assert_ne!(page, 0);
+            for (i, insn) in [
+                &[0x0f, 0x01, 0xfa][..],
+                &[0x0f, 0x01, 0xfb],
+                &[0x66, 0x0f, 0xae, 0x30],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let at = page + 32 + i * 32;
+                std::ptr::copy_nonoverlapping(insn.as_ptr(), at as *mut u8, insn.len());
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = at as u64;
+                assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+                assert!(fault_code(at, 16).2, "first fault records its replacement");
+                context.Rip = at as u64;
+                assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+                assert_eq!(context.Rip, at as u64 + insn.len() as u64);
+            }
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_queued_clzero_fault_validates_and_emulates_the_whole_loop() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: code and zeroed memory are in our allocated page throughout the test.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as usize;
+            assert_ne!(page, 0);
+            // The twelve-byte loop crosses its aligned sixteen; its five-byte patch fits.
+            let at = page + 26;
+            let insn = [
+                0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x48, 0x39, 0xd0, 0x72, 0xf4,
+            ];
+            std::ptr::copy_nonoverlapping(insn.as_ptr(), at as *mut u8, insn.len());
+            assert!(patch_clzero(at, &insn));
+            std::ptr::write_bytes((page + 256) as *mut u8, 0xaa, 192);
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = at as u64;
+            context.Rax = page as u64 + 256;
+            context.Rdx = page as u64 + 384;
+            assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+            assert_eq!(
+                (context.Rip, context.Rax),
+                (at as u64 + 12, page as u64 + 384)
+            );
+            assert!(
+                std::slice::from_raw_parts((page + 256) as *const u8, 128)
+                    .iter()
+                    .all(|&v| v == 0)
+            );
+            assert_eq!(*((page + 384) as *const u8), 0xaa);
+            *((at + 11) as *mut u8) ^= 1;
+            context.Rip = at as u64;
+            assert_eq!(
+                emulate(&mut context),
+                0,
+                "a changed unpatched suffix invalidates the record"
+            );
+            assert_eq!(context.Rip, at as u64);
+            VirtualFree(page as *mut _, 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn wait_instructions_are_replaced_inside_sixteen_aligned_bytes() {
