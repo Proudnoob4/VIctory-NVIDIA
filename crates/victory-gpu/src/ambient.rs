@@ -596,6 +596,14 @@ void raise(uint3 at : SV_DispatchThreadID) {
         return;
     }
     float3 was = unpack(light[p]);
+    // LOCAL (port of trustno1-coder/VIctory-NVIDIA#29): magenta/violet
+    // garbage the probes' memory held (green far under red and blue) is
+    // dropped, as VIctory-Belobug-AMD does; seen as a purple-blue glow on a
+    // lit sheet of paper in the prison cell. And the bluer kind of it (blue
+    // over 2.5x green and over red), which the first leaves as a faint
+    // violet. Sky light keeps green above 0.4x blue, sunsets keep blue low.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
