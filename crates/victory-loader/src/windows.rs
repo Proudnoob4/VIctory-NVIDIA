@@ -100,6 +100,16 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
             crate::hooks::OWN_UPSCALER_ENV
         );
     }
+    // SAFETY: just mapped, and no title code has run.
+    let (fps_applied, fps_target) = unsafe { crate::hooks::fps_unlock(loaded.base(), &prepared.original_hash) };
+    if fps_applied > 0 {
+        tracing::info!(
+            applied = fps_applied,
+            target_fps = fps_target.unwrap_or(0),
+            "title native FPS unlock hooks ({})",
+            crate::hooks::UNLOCK_FPS_ENV
+        );
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

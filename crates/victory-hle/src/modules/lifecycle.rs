@@ -110,7 +110,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = place(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -119,6 +119,28 @@ pub extern "system" fn CreateWindowExW(
     };
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_BORDERLESS=1`: the title's top-level window covers the whole
+/// primary monitor without a frame (what it shows is scaled to it), not a
+/// framed window fitted to the work area ([`fit`]).
+fn borderless() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BORDERLESS").is_some_and(|v| v == "1"))
+}
+
+/// The style and place a title window is made with: [`borderless`] for a
+/// top-level one if asked for, else as the title asked, [`fit`] to the screen.
+fn place(parent: HWND, style: u32, x: i32, y: i32, width: i32, height: i32) -> (u32, i32, i32, i32, i32) {
+    if parent.is_null() && borderless() && width > 0 && height > 0 {
+        let frame = wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_SYSMENU | wm::WS_MINIMIZEBOX | wm::WS_MAXIMIZEBOX;
+        // SAFETY: plain queries.
+        let (w, h) = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
+        tracing::info!(width, height, to = ?(w, h), "title window borderless over the whole screen (VICTORY_BORDERLESS)");
+        return ((style & !frame) | wm::WS_POPUP, 0, 0, w, h);
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (style, x, y, width, height)
 }
 
 /// See [`CreateWindowExW`].
@@ -136,7 +158,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = place(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(

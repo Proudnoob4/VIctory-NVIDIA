@@ -70,6 +70,12 @@ pub(crate) const RENDER_SCALE_ENV: &str = "VICTORY_RENDER_SCALE";
 /// Environment variable that makes the title use its own temporal upscaler
 /// on every console profile (Series S otherwise picks FSR).
 pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
+/// Environment variable that sets the title's native engine target FPS
+/// (`30..=1000`, e.g. `60`, `120`, `165`). Patches the engine's preset target
+/// FPS loads and `get_target_fps()` so `fwTimer::s_fMinFixedTimeStep` (`1/fps`),
+/// `target_frame_interval_us` (`1e6/fps`), the internal QPC limiter, and
+/// `SetFrameIntervalX` all scale together cleanly with zero game speedup.
+pub(crate) const UNLOCK_FPS_ENV: &str = "VICTORY_UNLOCK_FPS";
 
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
@@ -199,6 +205,90 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     applied
 }
 
+/// Parses `VICTORY_UNLOCK_FPS` (`30..=1000`; `0` or empty disables).
+fn parse_unlock_fps(text: &str) -> Option<u32> {
+    let v: u32 = text.trim().parse().ok()?;
+    (30..=1000).contains(&v).then_some(v)
+}
+
+/// Patches for native target FPS `fps` on build `1.0.2.1`:
+/// 1. `0x2241fd0` (`get_target_fps`): return `fps as f32` directly in `xmm0`
+///    (`mov eax, f32_bits; vmovd xmm0, eax; ret; nop`). Used both at boot
+///    (`fwTimer::Init(1.0 / fps)`) and on preset apply (`[0x6849844] = 1/fps`)
+///    so `fwTimer::Update` never clamps real QPC delta-time up to 1/30s.
+/// 2. `0x1e0fc62` (`apply_preset1` load of `[rdi+0x210]`): `mov eax, fps; nop`
+///    so `target_frame_interval_us` (`[0x98f84ac]`) becomes `1_000_000 / fps`.
+/// 3. `0x224359a` (`apply_preset2` load of `[rsi+0x210]`): `mov eax, fps; nop`
+///    so both `[0x98f84ac]` (internal QPC limiter + `SetFrameIntervalX`) and
+///    `[0x6849844]` (`fwTimer` min-dt floor) match `fps`.
+fn fps_unlock_patches(fps: u32) -> Vec<OwnedPatch> {
+    let fbits = (fps as f32).to_bits().to_le_bytes();
+    let ibits = fps.to_le_bytes();
+    vec![
+        OwnedPatch {
+            what: "fps unlock: get_target_fps() returns target f32",
+            rva: 0x2241fd0,
+            // push rsi; push rdi; sub rsp, 0x28; call 0x504c1b0
+            expect: vec![0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0xE8, 0xD5, 0xA1, 0xE0, 0x02],
+            // mov eax, f32_bits; vmovd xmm0, eax; ret; nop
+            new: vec![
+                0xB8, fbits[0], fbits[1], fbits[2], fbits[3], 0xC5, 0xF9, 0x6E, 0xC0, 0xC3, 0x90,
+            ],
+        },
+        OwnedPatch {
+            what: "fps unlock: preset apply #1 target_fps",
+            rva: 0x1e0fc62,
+            // mov eax, dword ptr [rdi+0x210]
+            expect: vec![0x8B, 0x87, 0x10, 0x02, 0x00, 0x00],
+            // mov eax, fps; nop
+            new: vec![0xB8, ibits[0], ibits[1], ibits[2], ibits[3], 0x90],
+        },
+        OwnedPatch {
+            what: "fps unlock: preset apply #2 target_fps",
+            rva: 0x224359a,
+            // mov eax, dword ptr [rsi+0x210]
+            expect: vec![0x8B, 0x86, 0x10, 0x02, 0x00, 0x00],
+            // mov eax, fps; nop
+            new: vec![0xB8, ibits[0], ibits[1], ibits[2], ibits[3], 0x90],
+        },
+    ]
+}
+
+/// Applies the native FPS unlock hook (`VICTORY_UNLOCK_FPS=30..=1000`).
+/// Returns `(applied_count, Some(fps))` when requested on build 1.0.2.1.
+///
+/// # Safety
+/// As `disarm_watchdog`.
+pub(crate) unsafe fn fps_unlock(base: usize, hash: &blake3::Hash) -> (usize, Option<u32>) {
+    let Ok(raw) = std::env::var(UNLOCK_FPS_ENV) else {
+        return (0, None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return (0, None);
+    }
+    let Some(fps) = parse_unlock_fps(trimmed) else {
+        tracing::warn!(text = raw, "{UNLOCK_FPS_ENV} wants an integer in 30..=1000 (or 0 for off)");
+        return (0, None);
+    };
+    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
+        tracing::debug!("fps unlock: not the 1.0.2.1 executable; nothing patched");
+        return (0, None);
+    }
+    let mut applied = 0;
+    for p in fps_unlock_patches(fps) {
+        let patch = Patch {
+            what: p.what,
+            rva: p.rva,
+            expect: &p.expect,
+            new: &p.new,
+        };
+        // SAFETY: forwarded from this function's contract.
+        applied += usize::from(unsafe { apply(base, &patch) });
+    }
+    (applied, Some(fps))
+}
+
 /// # Safety
 /// See `disarm_watchdog`.
 unsafe fn apply(base: usize, p: &Patch<'_>) -> bool {
@@ -253,6 +343,21 @@ mod tests {
     fn odd_scales_patch_only_the_own_upscaler() {
         assert_eq!(render_scale_patches(0, 0.6, true).len(), 2);
         assert_eq!(render_scale_patches(0, 0.5, false).len(), 2);
+    }
+
+    #[test]
+    fn fps_unlock_parses_and_encodes_cleanly() {
+        assert_eq!(parse_unlock_fps("60"), Some(60));
+        assert_eq!(parse_unlock_fps(" 165 "), Some(165));
+        assert_eq!(parse_unlock_fps("0"), None);
+        assert_eq!(parse_unlock_fps("29"), None);
+        assert_eq!(parse_unlock_fps("1001"), None);
+        let patches = fps_unlock_patches(60);
+        assert_eq!(patches.len(), 3);
+        assert!(patches.iter().all(|p| p.new.len() == p.expect.len()));
+        assert_eq!(&patches[0].new[1..5], &60.0f32.to_bits().to_le_bytes());
+        assert_eq!(&patches[1].new[1..5], &60u32.to_le_bytes());
+        assert_eq!(&patches[2].new[1..5], &60u32.to_le_bytes());
     }
 }
 
